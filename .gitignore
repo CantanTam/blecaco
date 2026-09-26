@@ -1,0 +1,5 @@
+__pycache__/
+wheels/
+PIL/
+pillow.libs/
+websockets/
