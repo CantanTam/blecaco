@@ -87,6 +87,37 @@ def _find_view3d():
                 return window, area, region
     return None, None, None
 
+def _with_viewport_camera(fn):
+    """临时把所有 3D 视口切到相机视角，执行 fn，然后还原。"""
+    saved = []
+    wm = bpy.context.window_manager
+    for window in wm.windows:
+        screen = getattr(window, "screen", None)
+        if not screen:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type != "VIEW_3D":
+                    continue
+                region_3d = getattr(space, "region_3d", None)
+                if region_3d is None:
+                    continue
+                try:
+                    saved.append((region_3d, region_3d.view_perspective))
+                    region_3d.view_perspective = 'CAMERA'
+                except Exception:
+                    pass
+    try:
+        fn()
+    finally:
+        for region_3d, orig in saved:
+            try:
+                region_3d.view_perspective = orig
+            except Exception:
+                pass
+
 # ---------------------------------------------------------------------------
 # 视口着色 / 引擎同步
 # ---------------------------------------------------------------------------
@@ -226,9 +257,8 @@ def _capture_camera_png(target_w=640):
     r.image_settings.file_format = "PNG"
 
     try:
-        _with_synced_shading(
-            scene,
-            lambda: bpy.ops.render.opengl(view_context=False, write_still=True),
+        _with_viewport_camera(
+            lambda: bpy.ops.render.opengl(view_context=True, write_still=True)
         )
     except Exception as e:
         print(f"[blecaco] render.opengl 异常: {e}")
