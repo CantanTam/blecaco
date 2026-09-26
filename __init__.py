@@ -30,6 +30,7 @@ from .ui import (
     BLECACO_OT_start,
     BLECACO_OT_stop,
     BLECACO_PT_main_panel,
+    unregister_ui,
 )
 
 
@@ -52,3 +53,4 @@ def unregister():
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     unregister_properties()
+    unregister_ui()

@@ -4,7 +4,7 @@ import bpy
 class BLECACO_SceneProperties(bpy.types.PropertyGroup):
     port: bpy.props.IntProperty(name="端口", default=12121, min=1024, max=65535)
     fps: bpy.props.IntProperty(name="帧率", default=10, min=1, max=30)
-    quality: bpy.props.IntProperty(name="JPEG 质量", default=70, min=10, max=100)
+    quality: bpy.props.IntProperty(name="画质", default=70, min=10, max=100)
 
 
 def register_properties():

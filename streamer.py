@@ -21,6 +21,13 @@ try:
 except ImportError:
     HAS_WS = False
 
+try:
+    import qrcode
+    from qrcode.image.pil import PilImage
+    HAS_QR = True
+except ImportError:
+    HAS_QR = False
+
 
 _TMP_CAPTURE = os.path.join(tempfile.gettempdir(), "blecaco_capture.png")
 
@@ -35,15 +42,15 @@ _HTML = """<!DOCTYPE html>
 const img=document.getElementById('v');
 let current=null;
 function connect(){
-  const ws=new WebSocket('ws://'+location.host+'/');
-  ws.binaryType='arraybuffer';
-  ws.onmessage=e=>{
-    if(!(e.data instanceof ArrayBuffer))return;
-    const url=URL.createObjectURL(new Blob([e.data],{type:'image/jpeg'}));
-    const old=current;current=url;img.src=url;
-    if(old)setTimeout(()=>URL.revokeObjectURL(old),500);
-  };
-  ws.onclose=()=>setTimeout(connect,3000);
+    const ws=new WebSocket('ws://'+location.host+'/');
+    ws.binaryType='arraybuffer';
+    ws.onmessage=e=>{
+        if(!(e.data instanceof ArrayBuffer))return;
+        const url=URL.createObjectURL(new Blob([e.data],{type:'image/jpeg'}));
+        const old=current;current=url;img.src=url;
+        if(old)setTimeout(()=>URL.revokeObjectURL(old),500);
+    };
+    ws.onclose=()=>setTimeout(connect,3000);
 }
 connect();
 </script>
@@ -80,6 +87,100 @@ def _find_view3d():
                 return window, area, region
     return None, None, None
 
+# ---------------------------------------------------------------------------
+# 视口着色 / 引擎同步
+# ---------------------------------------------------------------------------
+_SHADING_KEYS = (
+    "type", "light", "color_type",
+    "show_shadows", "show_cavity", "cavity_type",
+    "show_object_outline", "show_specular_highlight",
+    "studio_light", "background_type", "background_color",
+    "studiolight_rotate_z",
+)
+
+
+def _find_view_shading():
+    """找到第一个 3D 视口的 shading 和它的 render_engine 提示。"""
+    for window in bpy.context.window_manager.windows:
+        screen = getattr(window, "screen", None)
+        if not screen:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    return space.shading, getattr(space, "render_engine", None)
+    return None, None
+
+
+def _sync_shading_from_viewport(scene):
+    """把视口的着色设置同步到 scene，并临时切换渲染引擎以匹配。"""
+    view_shading, view_engine_hint = _find_view_shading()
+    if view_shading is None:
+        return
+
+    stype = getattr(view_shading, "type", "SOLID")
+    r = scene.render
+
+    if stype == "RENDERED":
+        # 渲染预览：用视口当前的引擎（EEVEE 或 Cycles）
+        if view_engine_hint:
+            try:
+                r.engine = view_engine_hint
+            except Exception:
+                pass
+    elif stype == "MATERIAL":
+        # 材质预览：必须用 EEVEE，否则 render.opengl 会回退到 Workbench
+        try:
+            r.engine = "BLENDER_EEVEE_NEXT"
+        except Exception:
+            try:
+                r.engine = "BLENDER_EEVEE"
+            except Exception:
+                pass
+    else:
+        # SOLID / WIREFRAME：用 Workbench
+        try:
+            r.engine = "BLENDER_WORKBENCH"
+        except Exception:
+            pass
+
+    # 同步 shading 参数（主要对 Workbench 生效）
+    target = scene.display.shading
+    for key in _SHADING_KEYS:
+        try:
+            setattr(target, key, getattr(view_shading, key))
+        except Exception:
+            pass
+
+
+def _with_synced_shading(scene, fn):
+    """临时同步着色/引擎，执行 fn，然后还原。"""
+    r = scene.render
+    orig_engine = r.engine
+
+    target = scene.display.shading
+    orig_shading = {}
+    for key in _SHADING_KEYS:
+        try:
+            orig_shading[key] = getattr(target, key)
+        except Exception:
+            pass
+
+    try:
+        _sync_shading_from_viewport(scene)
+        fn()
+    finally:
+        try:
+            r.engine = orig_engine
+        except Exception:
+            pass
+        for key, val in orig_shading.items():
+            try:
+                setattr(target, key, val)
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # 渲染活动相机视图
@@ -125,7 +226,10 @@ def _capture_camera_png(target_w=640):
     r.image_settings.file_format = "PNG"
 
     try:
-        bpy.ops.render.opengl(view_context=False, write_still=True)
+        _with_synced_shading(
+            scene,
+            lambda: bpy.ops.render.opengl(view_context=False, write_still=True),
+        )
     except Exception as e:
         print(f"[blecaco] render.opengl 异常: {e}")
         return None, None
@@ -398,6 +502,50 @@ def get_status():
         "camera_status": _state["camera_status"],
     }
 
+# ---------------------------------------------------------------------------
+# 二维码生成
+# ---------------------------------------------------------------------------
+_QR_CACHE = {"url": None, "path": None}
+
+def get_qr_path(url):
+    """生成 url 对应的二维码 PNG，返回文件路径（带缓存）。"""
+    if not HAS_QR or not HAS_PIL or not url:
+        return None
+
+    cached_path = _QR_CACHE.get("path")
+    if _QR_CACHE.get("url") == url and cached_path and os.path.exists(cached_path):
+        return cached_path
+
+    try:
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=8,
+            border=2,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(
+            image_factory=PilImage,
+            fill_color="black",
+            back_color="white",
+        )
+
+        path = os.path.join(tempfile.gettempdir(), "blecaco_qr.png")
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        img.save(path)
+
+        _QR_CACHE["url"] = url
+        _QR_CACHE["path"] = path
+        return path
+    except Exception as e:
+        print(f"[blecaco] 二维码生成失败: {e}")
+        return None
+    
 
 def get_local_ips():
     ips = []
