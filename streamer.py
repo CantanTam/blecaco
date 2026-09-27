@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import bpy
 import io
 import os
@@ -65,11 +67,14 @@ connect();
 </body></html>
 """
 
+# 播放页字节内容预先编码好：每次 HTTP 请求直接复用，无需重新 encode
+_HTML_BYTES = _HTML.encode("utf-8")
+
 
 # ---------------------------------------------------------------------------
 # 相机检查
 # ---------------------------------------------------------------------------
-def get_active_camera():
+def get_active_camera() -> tuple[bpy.types.Object | None, str | None]:
     """返回 (camera, error_msg)。没有活动相机时 error_msg 非空。"""
     try:
         scene = bpy.context.scene
@@ -82,7 +87,7 @@ def get_active_camera():
     return scene.camera, None
 
 
-def _find_view3d():
+def _find_view3d() -> tuple[bpy.types.Area | None, bpy.types.Region | None]:
     """返回 (area, region)；找不到时返回 (None, None)。"""
     for window in bpy.context.window_manager.windows:
         screen = getattr(window, "screen", None)
@@ -102,7 +107,7 @@ def _find_view3d():
 _offscreen_cache = None  # (width, height, GPUOffScreen)
 
 
-def _get_offscreen(width, height):
+def _get_offscreen(width: int, height: int) -> gpu.types.GPUOffScreen:
     """按尺寸复用 GPUOffScreen；尺寸变化时释放旧的重建。"""
     global _offscreen_cache
     if _offscreen_cache is not None:
@@ -115,7 +120,7 @@ def _get_offscreen(width, height):
     return off
 
 
-def _free_offscreen():
+def _free_offscreen() -> None:
     global _offscreen_cache
     if _offscreen_cache is None:
         return
@@ -129,7 +134,7 @@ def _free_offscreen():
 # ---------------------------------------------------------------------------
 # 渲染活动相机视图
 # ---------------------------------------------------------------------------
-def _capture_camera_image(target_w=640):
+def _capture_camera_image(target_w: int = 640) -> tuple[Image.Image | None, str | None]:
     """以活动 Camera 为视角、以当前 3D View 的 shading 设置进行 Offscreen 绘制。"""
     if not HAS_GPU:
         return None, "Blender GPU API 不可用"
@@ -236,7 +241,7 @@ def _capture_camera_image(target_w=640):
         return None, None
 
 
-def _img_to_jpeg(img, quality):
+def _img_to_jpeg(img: Image.Image, quality: int) -> bytes | None:
     """PIL Image -> JPEG bytes（不再经过 PNG 编解码中转）。"""
     try:
         if img.mode != "RGB":
@@ -253,7 +258,18 @@ def _img_to_jpeg(img, quality):
 # 服务器（队列式广播）
 # ---------------------------------------------------------------------------
 class _Server:
-    def __init__(self, port):
+    """WebSocket 推流服务器。
+
+    线程模型（改动前务必先看这里）：
+    - 主线程调用：`start()` / `stop()` / `broadcast()` / `client_count()`
+      （即 Blender 的 UI 与 `_frame_timer` 所在线程）；
+    - 后台线程（`self.loop`）：`_run()` / `_serve()` / `_broadcast_loop()` /
+      `_handler()` / `_process_request()`，只有它们能直接操作 asyncio 对象；
+    - `self.clients` 两边都会读写，因此**所有**访问都必须持有 `self._lock`；
+    - 跨线程投递帧走 `loop.call_soon_threadsafe()`（见 `broadcast()`）。
+    """
+
+    def __init__(self, port: int) -> None:
         self.port = port
         self.loop = None
         self.server = None
@@ -264,20 +280,23 @@ class _Server:
         self._queue = None
         self._broadcast_task = None
 
-    def start(self):
+    def start(self) -> None:
+        """启动后台事件循环线程（不阻塞主线程）。"""
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._running = True
         self.thread.start()
 
-    def _run(self):
+    def _run(self) -> None:
+        """后台线程入口：跑事件循环直到 _serve() 结束。"""
         asyncio.set_event_loop(self.loop)
         try:
             self.loop.run_until_complete(self._serve())
         except Exception as e:
             print(f"[blecaco] 服务器异常: {e}")
 
-    async def _serve(self):
+    async def _serve(self) -> None:
+        """后台线程：建帧队列、启动广播任务、监听 WebSocket 端口。"""
         self._queue = asyncio.Queue(maxsize=2)
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         self.server = await websockets.serve(
@@ -292,7 +311,8 @@ class _Server:
         )
         await self.server.wait_closed()
 
-    async def _broadcast_loop(self):
+    async def _broadcast_loop(self) -> None:
+        """后台线程：从队列取最新帧，逐个发给在线客户端。"""
         try:
             while self._running:
                 try:
@@ -312,7 +332,7 @@ class _Server:
         except Exception as e:
             print(f"[blecaco] 广播循环异常: {e}")
 
-    def _put_frame(self, data):
+    def _put_frame(self, data: bytes) -> None:
         """在事件循环线程里执行：丢弃旧帧，只保留最新帧。"""
         try:
             while self._queue.full():
@@ -324,7 +344,8 @@ class _Server:
         except Exception:
             pass
 
-    def broadcast(self, data):
+    def broadcast(self, data: bytes) -> None:
+        """主线程调用：把一帧交给后台广播循环（不阻塞，只保留最新帧）。"""
         if not self._running or not self.loop or not self._queue:
             return
         try:
@@ -332,22 +353,24 @@ class _Server:
         except Exception:
             pass
 
-    def client_count(self):
+    def client_count(self) -> int:
         """供 Blender 主线程安全查询在线客户端数量。"""
         with self._lock:
             return len(self.clients)
 
-    async def _process_request(self, connection, request):
+    async def _process_request(self, connection, request) -> _WSResponse | None:
+        """后台线程：普通 HTTP 请求直接返回播放页，WebSocket 握手交给框架。"""
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return None
-        body = _HTML.encode("utf-8")
+        body = _HTML_BYTES
         return _WSResponse(200, "OK", _WSHeaders({
             "Content-Type": "text/html; charset=utf-8",
             "Content-Length": str(len(body)),
             "Cache-Control": "no-store",
         }), body)
 
-    async def _handler(self, ws):
+    async def _handler(self, ws) -> None:
+        """后台线程：每个连接一个协程，负责登记/注销客户端与记录收到的消息。"""
         with self._lock:
             self.clients.add(ws)
         try:
@@ -363,7 +386,8 @@ class _Server:
             with self._lock:
                 self.clients.discard(ws)
 
-    def stop(self):
+    def stop(self) -> None:
+        """主线程调用：关闭服务器、停掉事件循环并释放 loop（可安全重复调用）。"""
         self._running = False
         if self._broadcast_task and self.loop:
             self.loop.call_soon_threadsafe(self._broadcast_task.cancel)
@@ -398,17 +422,30 @@ class _Server:
 # 主循环
 # ---------------------------------------------------------------------------
 _state = {
-    "server": None,
-    "running": False,
-    "error_streak": 0,
-    "frames": 0,
-    "camera_status": "",
+    "server": None,        # _Server | None，主线程读写
+    "running": False,      # 是否已 Start（主线程读写）
+    "error_streak": 0,     # 连续出错帧数，超过 60 自动停止
+    "frames": 0,           # 本次推流已发出的帧数
+    "camera_status": "",   # 最近一次的相机/渲染状态提示
 }
 
 
-def _frame_timer():
+def _frame_timer() -> float | None:
+    """Blender 主线程定时器：抓帧 → 编码 → 投递到广播队列。
+
+    返回下一次调用前的间隔（秒）；返回 None 表示停止该定时器。
+    """
     if not _state["running"]:
         return None
+
+    fps = max(bpy.context.scene.blecaco.fps, 1)
+
+    srv = _state["server"]
+    # 没有客户端时不抓帧：draw_view3d + 回读 + 编码是本流程最贵的部分（等于白渲一张图）。
+    # 客户端连上后最多等一个周期就能收到第一帧。
+    if srv is None or srv.client_count() == 0:
+        return 1.0 / fps
+
     try:
         img, err = _capture_camera_image()
         _state["camera_status"] = err or ""
@@ -416,9 +453,8 @@ def _frame_timer():
             props = bpy.context.scene.blecaco
             jpeg = _img_to_jpeg(img, props.quality)
             if jpeg:
-                _state["server"].broadcast(jpeg)
+                srv.broadcast(jpeg)
                 _state["frames"] += 1
-
         _state["error_streak"] = 0
     except Exception:
         traceback.print_exc()
@@ -427,10 +463,11 @@ def _frame_timer():
             print("[blecaco] 错误过多，自动停止")
             stop_stream()
             return None
-    return 1.0 / max(bpy.context.scene.blecaco.fps, 1)
+
+    return 1.0 / fps
 
 
-def start_stream():
+def start_stream() -> tuple[bool, str]:
     if _state["running"]:
         return False, "已在运行"
 
@@ -460,7 +497,7 @@ def start_stream():
     return True, "已启动"
 
 
-def stop_stream():
+def stop_stream() -> None:
     _state["running"] = False
     if bpy.app.timers.is_registered(_frame_timer):
         try:
@@ -475,11 +512,11 @@ def stop_stream():
     _state["camera_status"] = ""
 
 
-def is_running():
+def is_running() -> bool:
     return _state["running"]
 
 
-def get_status():
+def get_status() -> dict:
     s = _state["server"]
     return {
         "running": _state["running"],
@@ -494,7 +531,7 @@ def get_status():
 # ---------------------------------------------------------------------------
 _QR_CACHE = {"url": None, "path": None}
 
-def get_qr_path(url):
+def get_qr_path(url: str) -> str | None:
     """生成 url 对应的二维码 PNG，返回文件路径（带缓存）。"""
     if not HAS_QR or not HAS_PIL or not url:
         return None
@@ -534,7 +571,7 @@ def get_qr_path(url):
         return None
     
 
-def get_local_ips():
+def get_local_ips() -> list[str]:
     ips = []
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -549,18 +586,18 @@ def get_local_ips():
     return ips or ["127.0.0.1"]
 
 
-def _on_exit():
+def _on_exit() -> None:
     try:
         stop_stream()
     except Exception:
         pass
 
 
-def register():
+def register() -> None:
     atexit.register(_on_exit)
 
 
-def unregister():
+def unregister() -> None:
     stop_stream()
     try:
         atexit.unregister(_on_exit)
