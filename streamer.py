@@ -279,13 +279,24 @@ class _Server:
         self._running = False
         self._queue = None
         self._broadcast_task = None
+        # 启动结果回传：后台线程绑定成功后 set()；失败则先写 _start_error 再 set()
+        self._ready = threading.Event()
+        self._start_error = None
 
-    def start(self) -> None:
-        """启动后台事件循环线程（不阻塞主线程）。"""
+    def start(self) -> str | None:
+        """启动后台事件循环线程，并等待端口绑定结果。
+
+        返回 None 表示服务器已就绪；返回字符串表示启动失败（例如端口被占用）。
+        """
+        self._ready.clear()
+        self._start_error = None
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._running = True
         self.thread.start()
+        if not self._ready.wait(timeout=5.0):
+            return "启动超时（后台线程未就绪）"
+        return self._start_error
 
     def _run(self) -> None:
         """后台线程入口：跑事件循环直到 _serve() 结束。"""
@@ -293,12 +304,17 @@ class _Server:
         try:
             self.loop.run_until_complete(self._serve())
         except Exception as e:
+            # 启动阶段（例如端口被占用）和运行阶段的异常都走这里；
+            # 前者由 _start_error 回传给主线程，让面板能报出真正的原因。
+            self._start_error = str(e) or e.__class__.__name__
             print(f"[blecaco] 服务器异常: {e}")
+        finally:
+            self._ready.set()
 
     async def _serve(self) -> None:
-        """后台线程：建帧队列、启动广播任务、监听 WebSocket 端口。"""
+        """后台线程：绑定端口、启动广播任务，然后一直等到服务器关闭。"""
         self._queue = asyncio.Queue(maxsize=2)
-        self._broadcast_task = asyncio.create_task(self._broadcast_loop())
+        # 先绑定端口：失败就直接抛出（不会留下未完成的广播 Task），由 _run() 回传错误。
         self.server = await websockets.serve(
             self._handler,
             "0.0.0.0",
@@ -309,6 +325,9 @@ class _Server:
             compression=None,
             process_request=self._process_request,
         )
+        # 端口已绑定成功，通知主线程继续（start_stream 据此判断是否启动成功）
+        self._ready.set()
+        self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         await self.server.wait_closed()
 
     async def _broadcast_loop(self) -> None:
@@ -438,7 +457,12 @@ def _frame_timer() -> float | None:
     if not _state["running"]:
         return None
 
-    fps = max(bpy.context.scene.blecaco.fps, 1)
+    try:
+        # 配合 persistent=True：文件加载/切换的瞬间 scene 或属性可能暂时取不到，
+        # 这时只跳过本帧，不能让异常把定时器带走（那就变成静默断流了）。
+        fps = max(bpy.context.scene.blecaco.fps, 1)
+    except Exception:
+        return 0.1
 
     srv = _state["server"]
     # 没有客户端时不抓帧：draw_view3d + 回读 + 编码是本流程最贵的部分（等于白渲一张图）。
@@ -485,7 +509,11 @@ def start_stream() -> tuple[bool, str]:
 
     props = bpy.context.scene.blecaco
     server = _Server(props.port)
-    server.start()
+    err_start = server.start()
+    if err_start:
+        # 绑定失败（例如端口被占用）：回收线程/loop，并把原因报到面板
+        server.stop()
+        return False, f"启动失败（端口 {props.port}）: {err_start}"
     _state["server"] = server
     _state["running"] = True
     _state["error_streak"] = 0
@@ -493,7 +521,9 @@ def start_stream() -> tuple[bool, str]:
     _state["camera_status"] = err or ""
 
     if not bpy.app.timers.is_registered(_frame_timer):
-        bpy.app.timers.register(_frame_timer, first_interval=0.1)
+        # persistent=True：加载/新建 .blend 文件时不移除该定时器。
+        # 否则会出现"面板显示运行中、URL/二维码都在，但客户端收不到帧"的静默断流。
+        bpy.app.timers.register(_frame_timer, first_interval=0.1, persistent=True)
     return True, "已启动"
 
 
