@@ -15,14 +15,13 @@ from . import _is_vendored_pil, _pil_missing_hint
 
 try:
     from PIL import Image
-    import PIL as _PIL
 
     # 只认插件自带的 PIL（__init__ 已按当前 Python + 平台把它解压到插件目录，
     # 并置于 sys.path 最前面）。系统 site-packages 里的 Pillow 不具备跨平台
     # 通用性：一旦命中它就说明自带的那份不可用，这里按“缺 Pillow”处理，
     # 由面板把真正的原因（例如缺哪个平台标签的轮子）报出来。
-    if not _is_vendored_pil(_PIL.__file__):
-        raise ImportError(f"命中系统 Pillow：{_PIL.__file__}")
+    if not _is_vendored_pil(Image.__file__):
+        raise ImportError(f"命中系统 Pillow：{Image.__file__}")
 
     HAS_PIL = True
     _PIL_ERROR = ""
@@ -276,9 +275,9 @@ class _Server:
 
     线程模型（改动前务必先看这里）：
     - 主线程调用：`start()` / `stop()` / `broadcast()` / `client_count()`
-      （即 Blender 的 UI 与 `_frame_timer` 所在线程）；
+    （即 Blender 的 UI 与 `_frame_timer` 所在线程）；
     - 后台线程（`self.loop`）：`_run()` / `_serve()` / `_broadcast_loop()` /
-      `_handler()` / `_process_request()`，只有它们能直接操作 asyncio 对象；
+    `_handler()` / `_process_request()`，只有它们能直接操作 asyncio 对象；
     - `self.clients` 两边都会读写，因此**所有**访问都必须持有 `self._lock`；
     - 跨线程投递帧走 `loop.call_soon_threadsafe()`（见 `broadcast()`）。
     """
