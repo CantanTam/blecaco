@@ -28,6 +28,13 @@ try:
 except ImportError:
     HAS_QR = False
 
+try:
+    import gpu
+    HAS_GPU = True
+except ImportError:
+    gpu = None
+    HAS_GPU = False
+
 
 _TMP_CAPTURE = os.path.join(tempfile.gettempdir(), "blecaco_capture.png")
 
@@ -217,75 +224,130 @@ def _with_synced_shading(scene, fn):
 # 渲染活动相机视图
 # ---------------------------------------------------------------------------
 def _capture_camera_png(target_w=640):
-    """渲染活动相机视图到临时 PNG，返回 (png_bytes, error_msg)。"""
+    """以活动 Camera 为视角、以当前 3D View 的 shading 设置进行 Offscreen 绘制。"""
+    if not HAS_GPU:
+        return None, "Blender GPU API 不可用"
+
     cam, err = get_active_camera()
     if err:
         return None, err
 
     scene = bpy.context.scene
 
-    # 按视口宽高比决定输出尺寸
+    # 找到一个可用的 3D View；这里只借用它的 SpaceView3D/shading 设置，
+    # 不修改这个视口本身的 perspective，因此不会产生类似 Num 0 的跳转。
     window, area, region = _find_view3d()
-    if area:
-        aspect = area.width / max(area.height, 1)
-    else:
-        aspect = 16.0 / 9.0
-    target_h = max(2, int(target_w / aspect))
+    if not area or not region:
+        return None, "没有可用的 3D View"
+
+    space = next(
+        (s for s in area.spaces if s.type == "VIEW_3D"),
+        None,
+    )
+    if space is None:
+        return None, "没有可用的 SpaceView3D"
+
+    # 推流画幅必须与 Camera View(Numpad 0) 里的"相机框"一致：
+    r = scene.render
+    aspect = (r.resolution_x * r.pixel_aspect_x) / max(r.resolution_y * r.pixel_aspect_y, 1e-6)
+    target_h = max(2, int(round(target_w / aspect)))
     target_w -= target_w % 2
     target_h -= target_h % 2
 
-    r = scene.render
-    orig = {
-        "filepath": r.filepath,
-        "res_x": r.resolution_x,
-        "res_y": r.resolution_y,
-        "pct": r.resolution_percentage,
-        "fmt": r.image_settings.file_format,
-    }
+    depsgraph = bpy.context.evaluated_depsgraph_get()
 
-    tmp = _TMP_CAPTURE
-    try:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    except OSError:
-        pass
+    # Camera 决定“从哪里看”
+    view_matrix = cam.matrix_world.inverted()
 
-    r.filepath = tmp
-    r.resolution_x = target_w
-    r.resolution_y = target_h
-    r.resolution_percentage = 100
-    r.image_settings.file_format = "PNG"
+    # Camera 决定投影/焦距/裁剪等
+    projection_matrix = cam.calc_matrix_camera(
+        depsgraph,
+        x=target_w,
+        y=target_h,
+    )
+
+    offscreen = None
 
     try:
-        _with_viewport_camera(
-            lambda: bpy.ops.render.opengl(view_context=True, write_still=True)
+        offscreen = gpu.types.GPUOffScreen(
+            target_w,
+            target_h,
         )
+
+        # draw_view3d() 使用 SpaceView3D 的 viewport 绘制规则。
+        # 在真正的 Camera View 中，当前 Camera 不会作为“场景对象”
+        # 出现在相机画面里；但 Offscreen 这里仍然是普通 View3D 绘制，
+        # 因此必须临时关闭 Extras，否则 Camera / Light / Empty 等
+        # viewport 辅助对象会被画进推流画面。
+        overlay = space.overlay
+        orig_show_extras = overlay.show_extras
+
+        try:
+            overlay.show_extras = False
+
+            with offscreen.bind():
+                offscreen.draw_view3d(
+                    scene,
+                    bpy.context.view_layer,
+                    space,
+                    region,
+                    view_matrix,
+                    projection_matrix,
+                    do_color_management=True,
+                )
+
+                fb = gpu.state.active_framebuffer_get()
+
+                buffer = fb.read_color(
+                    0,
+                    0,
+                    target_w,
+                    target_h,
+                    4,
+                    0,
+                    "UBYTE",
+                )
+
+                buffer.dimensions = target_w * target_h * 4
+
+                # GPU Buffer → bytes
+                rgba = bytes(buffer)
+
+        finally:
+            # 完全恢复用户当前 viewport 的 Extras 设置。
+            overlay.show_extras = orig_show_extras
+
+        # GPU framebuffer 原点位于左下
+        # Pillow 图片需要上下翻转
+        img = Image.frombytes(
+            "RGBA",
+            (target_w, target_h),
+            rgba,
+        )
+
+        img = img.transpose(
+            Image.Transpose.FLIP_TOP_BOTTOM
+        )
+
+        buf = io.BytesIO()
+        img.save(
+            buf,
+            format="PNG",
+        )
+
+        return buf.getvalue(), None
+
     except Exception as e:
-        print(f"[blecaco] render.opengl 异常: {e}")
+        print(f"[blecaco] Offscreen 渲染异常: {e}")
+        traceback.print_exc()
         return None, None
+
     finally:
-        r.filepath = orig["filepath"]
-        r.resolution_x = orig["res_x"]
-        r.resolution_y = orig["res_y"]
-        r.resolution_percentage = orig["pct"]
-        r.image_settings.file_format = orig["fmt"]
-
-    if not os.path.exists(tmp):
-        return None, None
-    try:
-        if os.path.getsize(tmp) < 100:
-            return None, None
-        with open(tmp, "rb") as f:
-            data = f.read()
-    except OSError:
-        return None, None
-
-    if len(data) < 8 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        print("[blecaco] PNG 数据损坏，跳过这一帧")
-        return None, None
-
-    return data, None
-
+        if offscreen is not None:
+            try:
+                offscreen.free()
+            except Exception:
+                pass
 
 def _png_to_jpeg(png, quality):
     if not HAS_PIL:
@@ -481,6 +543,9 @@ def start_stream():
         return False, "缺少 Pillow"
     if not HAS_WS:
         return False, "缺少 websockets"
+
+    if not HAS_GPU:
+        return False, "Blender GPU API 不可用"
 
     _, err = get_active_camera()
     if err:
