@@ -11,11 +11,25 @@ import threading
 import traceback
 import atexit
 
+from . import _is_vendored_pil, _pil_missing_hint
+
 try:
     from PIL import Image
+    import PIL as _PIL
+
+    # 只认插件自带的 PIL（__init__ 已按当前 Python + 平台把它解压到插件目录，
+    # 并置于 sys.path 最前面）。系统 site-packages 里的 Pillow 不具备跨平台
+    # 通用性：一旦命中它就说明自带的那份不可用，这里按“缺 Pillow”处理，
+    # 由面板把真正的原因（例如缺哪个平台标签的轮子）报出来。
+    if not _is_vendored_pil(_PIL.__file__):
+        raise ImportError(f"命中系统 Pillow：{_PIL.__file__}")
+
     HAS_PIL = True
-except ImportError:
+    _PIL_ERROR = ""
+except ImportError as exc:
+    # Pillow 不可用时不会用到 Image：HAS_PIL 为 False 时启动阶段就直接返回了
     HAS_PIL = False
+    _PIL_ERROR = str(exc)
 
 try:
     import websockets
@@ -496,7 +510,7 @@ def start_stream() -> tuple[bool, str]:
         return False, "已在运行"
 
     for ok, msg in (
-        (HAS_PIL, "缺少 Pillow"),
+        (HAS_PIL, _pil_missing_hint(_PIL_ERROR)),
         (HAS_WS, "缺少 websockets"),
         (HAS_GPU, "Blender GPU API 不可用"),
     ):
