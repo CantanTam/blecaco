@@ -95,9 +95,39 @@ def _find_view3d():
     return None, None, None
 
 # ---------------------------------------------------------------------------
+# GPU Offscreen 复用（避免每帧创建/销毁显存资源）
+# ---------------------------------------------------------------------------
+_offscreen_cache = None  # (width, height, GPUOffScreen)
+
+
+def _get_offscreen(width, height):
+    """按尺寸复用 GPUOffScreen；尺寸变化时释放旧的重建。"""
+    global _offscreen_cache
+    if _offscreen_cache is not None:
+        cw, ch, off = _offscreen_cache
+        if (cw, ch) == (width, height):
+            return off
+        _free_offscreen()
+    off = gpu.types.GPUOffScreen(width, height)
+    _offscreen_cache = (width, height, off)
+    return off
+
+
+def _free_offscreen():
+    global _offscreen_cache
+    if _offscreen_cache is None:
+        return
+    off = _offscreen_cache[2]
+    _offscreen_cache = None      # 先断开引用，再释放，避免悬垂引用
+    try:
+        off.free()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # 渲染活动相机视图
 # ---------------------------------------------------------------------------
-def _capture_camera_png(target_w=640):
+def _capture_camera_image(target_w=640):
     """以活动 Camera 为视角、以当前 3D View 的 shading 设置进行 Offscreen 绘制。"""
     if not HAS_GPU:
         return None, "Blender GPU API 不可用"
@@ -140,13 +170,8 @@ def _capture_camera_png(target_w=640):
         y=target_h,
     )
 
-    offscreen = None
-
     try:
-        offscreen = gpu.types.GPUOffScreen(
-            target_w,
-            target_h,
-        )
+        offscreen = _get_offscreen(target_w, target_h)
 
         # draw_view3d() 使用 SpaceView3D 的 viewport 绘制规则。
         # 在真正的 Camera View 中，当前 Camera 不会作为“场景对象”
@@ -191,44 +216,27 @@ def _capture_camera_png(target_w=640):
             # 完全恢复用户当前 viewport 的 Extras 设置。
             overlay.show_extras = orig_show_extras
 
-        # GPU framebuffer 原点位于左下
-        # Pillow 图片需要上下翻转
+        # GPU framebuffer 原点位于左下，PIL 需要上下翻转。
+        # 这里直接把 PIL Image 交给上层编码 JPEG，不再经过 PNG 中转。
         img = Image.frombytes(
             "RGBA",
             (target_w, target_h),
             rgba,
-        )
+        ).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
-        img = img.transpose(
-            Image.Transpose.FLIP_TOP_BOTTOM
-        )
-
-        buf = io.BytesIO()
-        img.save(
-            buf,
-            format="PNG",
-        )
-
-        return buf.getvalue(), None
+        return img, None
 
     except Exception as e:
         print(f"[blecaco] Offscreen 渲染异常: {e}")
         traceback.print_exc()
+        # 出错时丢弃缓存，下一帧按需重建，避免坏对象被反复复用
+        _free_offscreen()
         return None, None
 
-    finally:
-        if offscreen is not None:
-            try:
-                offscreen.free()
-            except Exception:
-                pass
 
-def _png_to_jpeg(png, quality):
-    if not HAS_PIL:
-        return png
+def _img_to_jpeg(img, quality):
+    """PIL Image -> JPEG bytes（不再经过 PNG 编解码中转）。"""
     try:
-        img = Image.open(io.BytesIO(png))
-        img.load()
         if img.mode != "RGB":
             img = img.convert("RGB")
         buf = io.BytesIO()
@@ -391,14 +399,15 @@ def _frame_timer():
     if not _state["running"]:
         return None
     try:
-        png, err = _capture_camera_png()
+        img, err = _capture_camera_image()
         _state["camera_status"] = err or ""
-        if png:
+        if img is not None:
             props = bpy.context.scene.blecaco
-            jpeg = _png_to_jpeg(png, props.quality)
+            jpeg = _img_to_jpeg(img, props.quality)
             if jpeg:
                 _state["server"].broadcast(jpeg)
                 _state["frames"] += 1
+
         _state["error_streak"] = 0
     except Exception:
         traceback.print_exc()
@@ -446,6 +455,8 @@ def stop_stream():
             bpy.app.timers.unregister(_frame_timer)
         except Exception:
             pass
+    # 停止后立即释放显存里的 offscreen（Start 时会按需重建）
+    _free_offscreen()
     if _state["server"]:
         _state["server"].stop()
         _state["server"] = None
