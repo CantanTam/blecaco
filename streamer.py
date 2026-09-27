@@ -17,6 +17,9 @@ except ImportError:
 
 try:
     import websockets
+    # 播放页在 HTTP 握手阶段直接返回，需要这两者（websockets 自带 http11/datastructures）
+    from websockets.datastructures import Headers as _WSHeaders
+    from websockets.http11 import Response as _WSResponse
     HAS_WS = True
 except ImportError:
     HAS_WS = False
@@ -35,8 +38,6 @@ except ImportError:
     gpu = None
     HAS_GPU = False
 
-
-_TMP_CAPTURE = os.path.join(tempfile.gettempdir(), "blecaco_capture.png")
 
 _HTML = """<!DOCTYPE html>
 <html><head>
@@ -82,6 +83,7 @@ def get_active_camera():
 
 
 def _find_view3d():
+    """返回 (area, region)；找不到时返回 (None, None)。"""
     for window in bpy.context.window_manager.windows:
         screen = getattr(window, "screen", None)
         if not screen:
@@ -91,8 +93,8 @@ def _find_view3d():
                 continue
             region = next((r for r in area.regions if r.type == "WINDOW"), None)
             if region:
-                return window, area, region
-    return None, None, None
+                return area, region
+    return None, None
 
 # ---------------------------------------------------------------------------
 # GPU Offscreen 复用（避免每帧创建/销毁显存资源）
@@ -140,7 +142,7 @@ def _capture_camera_image(target_w=640):
 
     # 找到一个可用的 3D View；这里只借用它的 SpaceView3D/shading 设置，
     # 不修改这个视口本身的 perspective，因此不会产生类似 Num 0 的跳转。
-    window, area, region = _find_view3d()
+    area, region = _find_view3d()
     if not area or not region:
         return None, "没有可用的 3D View"
 
@@ -282,7 +284,10 @@ class _Server:
             self._handler,
             "0.0.0.0",
             self.port,
-            max_size=None,
+            # 入站消息上限（客户端从不发送业务数据，这里只是防止超大消息占用内存）
+            max_size=1 << 20,
+            # 关闭 permessage-deflate：JPEG 已经是压缩数据，再 deflate 只是白烧两端 CPU
+            compression=None,
             process_request=self._process_request,
         )
         await self.server.wait_closed()
@@ -327,20 +332,20 @@ class _Server:
         except Exception:
             pass
 
+    def client_count(self):
+        """供 Blender 主线程安全查询在线客户端数量。"""
+        with self._lock:
+            return len(self.clients)
+
     async def _process_request(self, connection, request):
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return None
-        try:
-            from websockets.http11 import Response
-            from websockets.datastructures import Headers
-            body = _HTML.encode("utf-8")
-            return Response(200, "OK", Headers({
-                "Content-Type": "text/html; charset=utf-8",
-                "Content-Length": str(len(body)),
-                "Cache-Control": "no-store",
-            }), body)
-        except Exception:
-            return None
+        body = _HTML.encode("utf-8")
+        return _WSResponse(200, "OK", _WSHeaders({
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": str(len(body)),
+            "Cache-Control": "no-store",
+        }), body)
 
     async def _handler(self, ws):
         with self._lock:
@@ -374,6 +379,12 @@ class _Server:
             self.loop.call_soon_threadsafe(self.loop.stop)
         if self.thread:
             self.thread.join(timeout=2)
+        # 释放在 _run() 里创建的 event loop（不 close 会导致反复 Start/Stop 泄漏 fd）
+        if self.loop:
+            try:
+                self.loop.close()
+            except Exception:
+                pass
         self.loop = None
         self.thread = None
         self.server = None
@@ -422,13 +433,14 @@ def _frame_timer():
 def start_stream():
     if _state["running"]:
         return False, "已在运行"
-    if not HAS_PIL:
-        return False, "缺少 Pillow"
-    if not HAS_WS:
-        return False, "缺少 websockets"
 
-    if not HAS_GPU:
-        return False, "Blender GPU API 不可用"
+    for ok, msg in (
+        (HAS_PIL, "缺少 Pillow"),
+        (HAS_WS, "缺少 websockets"),
+        (HAS_GPU, "Blender GPU API 不可用"),
+    ):
+        if not ok:
+            return False, msg
 
     _, err = get_active_camera()
     if err:
@@ -460,11 +472,6 @@ def stop_stream():
     if _state["server"]:
         _state["server"].stop()
         _state["server"] = None
-    if os.path.exists(_TMP_CAPTURE):
-        try:
-            os.remove(_TMP_CAPTURE)
-        except Exception:
-            pass
     _state["camera_status"] = ""
 
 
@@ -478,7 +485,7 @@ def get_status():
         "running": _state["running"],
         "frames": _state["frames"],
         "errors": _state["error_streak"],
-        "clients": len(s.clients) if s else 0,
+        "clients": s.client_count() if s else 0,
         "camera_status": _state["camera_status"],
     }
 
