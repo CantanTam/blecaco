@@ -102,7 +102,7 @@ class BLECACO_PT_main_panel(bpy.types.Panel):
             col.operator("blecaco.stop", icon="SNAP_FACE")
 
             # 二维码（用第一个 IP 生成）
-            if ips:
+            if ips and status["clients"] == 0:
                 url = f"http://{ips[0]}:{props.port}"
                 icon_id = _load_qr_icon(url)
                 if icon_id is not None:
