@@ -208,6 +208,10 @@ from .addon_property import (
     register_properties,
     unregister_properties,
 )
+
+from . import handler
+from . import setting
+
 from .streamer import (
     register as streamer_register,
     unregister as streamer_unregister,
@@ -231,11 +235,15 @@ def register():
     register_properties()
     for cls in _classes:
         bpy.utils.register_class(cls)
+    handler.register()
     streamer_register()
+    setting.register()
 
 
 def unregister():
+    setting.unregister()
     streamer_unregister()
+    handler.unregister()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     unregister_properties()

@@ -10,9 +10,10 @@ import tempfile
 import threading
 import traceback
 import atexit
+from dataclasses import dataclass
 
 from . import _is_vendored_pil, _pil_missing_hint
-
+from . import handler as _message_handler
 try:
     from PIL import Image
 
@@ -92,7 +93,7 @@ def get_active_camera() -> tuple[bpy.types.Object | None, str | None]:
     try:
         scene = bpy.context.scene
     except Exception:
-        return None, "无场景"
+        scene = None
     if scene is None:
         return None, "无场景"
     if scene.camera is None:
@@ -100,8 +101,16 @@ def get_active_camera() -> tuple[bpy.types.Object | None, str | None]:
     return scene.camera, None
 
 
-def _find_view3d() -> tuple[bpy.types.Area | None, bpy.types.Region | None]:
-    """返回 (area, region)；找不到时返回 (None, None)。"""
+def _find_view3d() -> tuple[
+    bpy.types.Area | None,
+    bpy.types.Region | None,
+    bpy.types.SpaceView3D | None,
+]:
+    """返回 (area, region, space)；找不到时对应项为 None。
+
+    space 取自同一个 area；若该 area 没有 SpaceView3D，仍然把它返回出去，
+    由调用方给出 "没有可用的 SpaceView3D" 的提示。
+    """
     for window in bpy.context.window_manager.windows:
         screen = getattr(window, "screen", None)
         if not screen:
@@ -110,9 +119,11 @@ def _find_view3d() -> tuple[bpy.types.Area | None, bpy.types.Region | None]:
             if area.type != "VIEW_3D":
                 continue
             region = next((r for r in area.regions if r.type == "WINDOW"), None)
-            if region:
-                return area, region
-    return None, None
+            if not region:
+                continue
+            space = next((s for s in area.spaces if s.type == "VIEW_3D"), None)
+            return area, region, space
+    return None, None, None
 
 # ---------------------------------------------------------------------------
 # GPU Offscreen 复用（避免每帧创建/销毁显存资源）
@@ -147,6 +158,62 @@ def _free_offscreen() -> None:
 # ---------------------------------------------------------------------------
 # 渲染活动相机视图
 # ---------------------------------------------------------------------------
+def _draw_offscreen(
+    offscreen: gpu.types.GPUOffScreen,
+    scene,
+    space,
+    region,
+    view_matrix,
+    projection_matrix,
+    width: int,
+    height: int,
+) -> bytes:
+    """在 offscreen 上按 SpaceView3D 的规则绘制并回读 RGBA 字节。
+
+    draw_view3d() 使用 SpaceView3D 的 viewport 绘制规则。在真正的 Camera
+    View 中，当前 Camera 不会作为“场景对象”出现在相机画面里；但 Offscreen
+    这里仍然是普通 View3D 绘制，因此必须临时关闭 Extras，否则 Camera /
+    Light / Empty 等 viewport 辅助对象会被画进推流画面。
+    """
+    overlay = space.overlay
+    orig_show_extras = overlay.show_extras
+
+    try:
+        overlay.show_extras = False
+
+        with offscreen.bind():
+            offscreen.draw_view3d(
+                scene,
+                bpy.context.view_layer,
+                space,
+                region,
+                view_matrix,
+                projection_matrix,
+                do_color_management=True,
+            )
+
+            fb = gpu.state.active_framebuffer_get()
+
+            buffer = fb.read_color(
+                0,
+                0,
+                width,
+                height,
+                4,
+                0,
+                "UBYTE",
+            )
+
+            buffer.dimensions = width * height * 4
+
+            # GPU Buffer → bytes
+            return bytes(buffer)
+
+    finally:
+        # 无论绘制成功与否，都完全恢复用户当前 viewport 的 Extras 设置。
+        overlay.show_extras = orig_show_extras
+
+
 def _capture_camera_image(target_w: int = 640) -> tuple[Image.Image | None, str | None]:
     """以活动 Camera 为视角、以当前 3D View 的 shading 设置进行 Offscreen 绘制。"""
     if not HAS_GPU:
@@ -160,14 +227,9 @@ def _capture_camera_image(target_w: int = 640) -> tuple[Image.Image | None, str 
 
     # 找到一个可用的 3D View；这里只借用它的 SpaceView3D/shading 设置，
     # 不修改这个视口本身的 perspective，因此不会产生类似 Num 0 的跳转。
-    area, region = _find_view3d()
-    if not area or not region:
+    area, region, space = _find_view3d()
+    if not area:
         return None, "没有可用的 3D View"
-
-    space = next(
-        (s for s in area.spaces if s.type == "VIEW_3D"),
-        None,
-    )
     if space is None:
         return None, "没有可用的 SpaceView3D"
 
@@ -192,49 +254,16 @@ def _capture_camera_image(target_w: int = 640) -> tuple[Image.Image | None, str 
 
     try:
         offscreen = _get_offscreen(target_w, target_h)
-
-        # draw_view3d() 使用 SpaceView3D 的 viewport 绘制规则。
-        # 在真正的 Camera View 中，当前 Camera 不会作为“场景对象”
-        # 出现在相机画面里；但 Offscreen 这里仍然是普通 View3D 绘制，
-        # 因此必须临时关闭 Extras，否则 Camera / Light / Empty 等
-        # viewport 辅助对象会被画进推流画面。
-        overlay = space.overlay
-        orig_show_extras = overlay.show_extras
-
-        try:
-            overlay.show_extras = False
-
-            with offscreen.bind():
-                offscreen.draw_view3d(
-                    scene,
-                    bpy.context.view_layer,
-                    space,
-                    region,
-                    view_matrix,
-                    projection_matrix,
-                    do_color_management=True,
-                )
-
-                fb = gpu.state.active_framebuffer_get()
-
-                buffer = fb.read_color(
-                    0,
-                    0,
-                    target_w,
-                    target_h,
-                    4,
-                    0,
-                    "UBYTE",
-                )
-
-                buffer.dimensions = target_w * target_h * 4
-
-                # GPU Buffer → bytes
-                rgba = bytes(buffer)
-
-        finally:
-            # 完全恢复用户当前 viewport 的 Extras 设置。
-            overlay.show_extras = orig_show_extras
+        rgba = _draw_offscreen(
+            offscreen,
+            scene,
+            space,
+            region,
+            view_matrix,
+            projection_matrix,
+            target_w,
+            target_h,
+        )
 
         # GPU framebuffer 原点位于左下，PIL 需要上下翻转。
         # 这里直接把 PIL Image 交给上层编码 JPEG，不再经过 PNG 中转。
@@ -367,11 +396,9 @@ class _Server:
     def _put_frame(self, data: bytes) -> None:
         """在事件循环线程里执行：丢弃旧帧，只保留最新帧。"""
         try:
+            # full() 成立说明队列非空，get_nowait() 不会抛 QueueEmpty。
             while self._queue.full():
-                try:
-                    self._queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+                self._queue.get_nowait()
             self._queue.put_nowait(data)
         except Exception:
             pass
@@ -384,6 +411,33 @@ class _Server:
             self.loop.call_soon_threadsafe(self._put_frame, data)
         except Exception:
             pass
+
+    async def _broadcast_text(self, message: str) -> None:
+        """在 WebSocket 事件循环中向客户端发送文本消息。"""
+        with self._lock:
+            clients = list(self.clients)
+
+        for ws in clients:
+            try:
+                await ws.send(message)
+            except Exception as exc:
+                print(f"[blecaco] 文本消息发送失败: {exc}")
+                with self._lock:
+                    self.clients.discard(ws)
+
+    def send_text(self, message: str) -> bool:
+        """供 Blender 主线程调用，异步向客户端广播文本消息。"""
+        if not self._running or self.loop is None or self.loop.is_closed():
+            return False
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast_text(message),
+                self.loop,
+            )
+            return True
+        except RuntimeError:
+            return False
 
     def client_count(self) -> int:
         """供 Blender 主线程安全查询在线客户端数量。"""
@@ -402,18 +456,25 @@ class _Server:
         }), body)
 
     async def _handler(self, ws) -> None:
-        """后台线程：每个连接一个协程，负责登记/注销客户端与记录收到的消息。"""
+        """后台线程：接收文本消息，并转交给 handler.py。"""
         with self._lock:
             self.clients.add(ws)
+
         try:
             async for message in ws:
                 if isinstance(message, str):
+                    # 原始消息交给 handler.py，具体解析和分流由它负责
+                    _message_handler.enqueue_message(message)
+
+                    # 保留控制台日志，方便调试
                     try:
                         print(f"[blecaco] 收到: {json.loads(message)}")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except json.JSONDecodeError:
+                        print(f"[blecaco] 收到无效 JSON: {message}")
+
+        except Exception as exc:
+            print(f"[blecaco] WebSocket 接收异常: {exc}")
+
         finally:
             with self._lock:
                 self.clients.discard(ws)
@@ -453,21 +514,53 @@ class _Server:
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
-_state = {
-    "server": None,        # _Server | None，主线程读写
-    "running": False,      # 是否已 Start（主线程读写）
-    "error_streak": 0,     # 连续出错帧数，超过 60 自动停止
-    "frames": 0,           # 本次推流已发出的帧数
-    "camera_status": "",   # 最近一次的相机/渲染状态提示
-}
+MAX_ERROR_STREAK = 60        # 连续出错帧数上限，超过则自动停止
+FIRST_FRAME_INTERVAL = 0.1   # 帧定时器首次触发间隔（秒）
+FALLBACK_INTERVAL = 0.1      # fps 暂时取不到时的兜底间隔（秒）
 
+
+@dataclass
+class _State:
+    """推流运行时状态（仅 Blender 主线程读写）。"""
+    server: "_Server | None" = None   # 当前服务器实例
+    running: bool = False             # 是否已 Start（不代表有客户端在收帧）
+    error_streak: int = 0             # 连续出错帧数，超过 MAX_ERROR_STREAK 自动停止
+    frames: int = 0                   # 本次推流已发出的帧数
+    camera_status: str = ""           # 最近一次的相机/渲染状态提示
+
+
+_state = _State()
+
+def send_setting_to_clients(name: str, value) -> bool:
+    """向连接的客户端发送 setting 类型 JSON，不发送 action。"""
+    server = _state.server
+
+    if not _state.running or server is None:
+        print("[blecaco] 无法发送设置：WebSocket 服务器未运行")
+        return False
+
+    try:
+        message = json.dumps(
+            {
+                "type": "setting",
+                "name": name,
+                "value": value,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"[blecaco] 设置 JSON 序列化失败: {exc}")
+        return False
+
+    return server.send_text(message)
 
 def _frame_timer() -> float | None:
     """Blender 主线程定时器：抓帧 → 编码 → 投递到广播队列。
 
     返回下一次调用前的间隔（秒）；返回 None 表示停止该定时器。
     """
-    if not _state["running"]:
+    if not _state.running:
         return None
 
     try:
@@ -475,50 +568,53 @@ def _frame_timer() -> float | None:
         # 这时只跳过本帧，不能让异常把定时器带走（那就变成静默断流了）。
         fps = max(bpy.context.scene.blecaco.fps, 1)
     except Exception:
-        return 0.1
+        return FALLBACK_INTERVAL
 
-    srv = _state["server"]
+    interval = 1.0 / fps
+
+    srv = _state.server
     # 没有客户端时不抓帧：draw_view3d + 回读 + 编码是本流程最贵的部分（等于白渲一张图）。
     # 客户端连上后最多等一个周期就能收到第一帧。
     if srv is None or srv.client_count() == 0:
-        return 1.0 / fps
+        return interval
 
     try:
         img, err = _capture_camera_image()
-        _state["camera_status"] = err or ""
+        _state.camera_status = err or ""
         if img is not None:
             props = bpy.context.scene.blecaco
             jpeg = _img_to_jpeg(img, props.quality)
             if jpeg:
                 srv.broadcast(jpeg)
-                _state["frames"] += 1
-        _state["error_streak"] = 0
+                _state.frames += 1
+        _state.error_streak = 0
     except Exception:
         traceback.print_exc()
-        _state["error_streak"] += 1
-        if _state["error_streak"] > 60:
+        _state.error_streak += 1
+        if _state.error_streak > MAX_ERROR_STREAK:
             print("[blecaco] 错误过多，自动停止")
             stop_stream()
             return None
 
-    return 1.0 / fps
+    return interval
 
 
 def start_stream() -> tuple[bool, str]:
-    if _state["running"]:
+    if _state.running:
         return False, "已在运行"
 
-    for ok, msg in (
-        (HAS_PIL, _pil_missing_hint(_PIL_ERROR)),
-        (HAS_WS, "缺少 websockets"),
-        (HAS_GPU, "Blender GPU API 不可用"),
-    ):
-        if not ok:
-            return False, msg
+    # 依赖检查：顺序即报错优先级。PIL 的提示按需生成，
+    # 避免 Pillow 正常时也去扫一遍 wheels/ 目录。
+    if not HAS_PIL:
+        return False, _pil_missing_hint(_PIL_ERROR)
+    if not HAS_WS:
+        return False, "缺少 websockets"
+    if not HAS_GPU:
+        return False, "Blender GPU API 不可用"
 
-    _, err = get_active_camera()
-    if err:
-        print(f"[blecaco] 启动时警告: {err}")
+    _, cam_err = get_active_camera()
+    if cam_err:
+        print(f"[blecaco] 启动时警告: {cam_err}")
 
     props = bpy.context.scene.blecaco
     server = _Server(props.port)
@@ -527,21 +623,25 @@ def start_stream() -> tuple[bool, str]:
         # 绑定失败（例如端口被占用）：回收线程/loop，并把原因报到面板
         server.stop()
         return False, f"启动失败（端口 {props.port}）: {err_start}"
-    _state["server"] = server
-    _state["running"] = True
-    _state["error_streak"] = 0
-    _state["frames"] = 0
-    _state["camera_status"] = err or ""
+    _state.server = server
+    _state.running = True
+    _state.error_streak = 0
+    _state.frames = 0
+    _state.camera_status = cam_err or ""
 
     if not bpy.app.timers.is_registered(_frame_timer):
         # persistent=True：加载/新建 .blend 文件时不移除该定时器。
         # 否则会出现"面板显示运行中、URL/二维码都在，但客户端收不到帧"的静默断流。
-        bpy.app.timers.register(_frame_timer, first_interval=0.1, persistent=True)
+        bpy.app.timers.register(
+            _frame_timer,
+            first_interval=FIRST_FRAME_INTERVAL,
+            persistent=True,
+        )
     return True, "已启动"
 
 
 def stop_stream() -> None:
-    _state["running"] = False
+    _state.running = False
     if bpy.app.timers.is_registered(_frame_timer):
         try:
             bpy.app.timers.unregister(_frame_timer)
@@ -549,24 +649,24 @@ def stop_stream() -> None:
             pass
     # 停止后立即释放显存里的 offscreen（Start 时会按需重建）
     _free_offscreen()
-    if _state["server"]:
-        _state["server"].stop()
-        _state["server"] = None
-    _state["camera_status"] = ""
+    if _state.server:
+        _state.server.stop()
+        _state.server = None
+    _state.camera_status = ""
 
 
 def is_running() -> bool:
-    return _state["running"]
+    return _state.running
 
 
 def get_status() -> dict:
-    s = _state["server"]
+    s = _state.server
     return {
-        "running": _state["running"],
-        "frames": _state["frames"],
-        "errors": _state["error_streak"],
+        "running": _state.running,
+        "frames": _state.frames,
+        "errors": _state.error_streak,
         "clients": s.client_count() if s else 0,
-        "camera_status": _state["camera_status"],
+        "camera_status": _state.camera_status,
     }
 
 # ---------------------------------------------------------------------------
