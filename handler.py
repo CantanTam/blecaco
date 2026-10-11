@@ -23,7 +23,7 @@ ACTION_MODULES = {
     "game": "game",
     "plane": "plane",
     "car": "car",
-    "free": "free",
+    "free": "free_action",
     "drone":"drone",
     "camera":"camera",
 }
