@@ -6,14 +6,10 @@ from mathutils import Quaternion, Vector
 # Free Mode 参数
 # ============================================================
 
-# 平移比例：
-# 1.0 = 默认比例
+# 平移比例：手机真实位移（米）→ Blender 世界位移 的比例。
+# 1.0 = 1:1（手机走 1 米，Blender 摄像机走 1 米）。
 # 后续可以在 Blender 插件面板中添加可调选项。
-move_scale_ratio: float = 50.0
-
-# 光流像素位移转换为 Blender 位移单位的基础比例。
-# 最终移动量 = 光流位移 × 此值 × move_scale_ratio
-FLOW_PIXEL_TO_BLENDER_UNITS: float = 0.005
+move_scale_ratio: float = 1.0
 
 
 # ============================================================
@@ -28,13 +24,17 @@ _initial_camera_rotation = None
 # 坐标转换
 # ============================================================
 
-def _phone_motion_to_camera_local(
-    phone_motion: Vector,
+def _phone_body_to_camera_local(
+    body_motion: Vector,
 ) -> Vector:
     """
-    将手机坐标系中的位移向量转换为 Blender Camera 局部坐标系。
+    将「手机机体坐标系」下的位移向量（米，来自 OpenVINS）转换为
+    Blender Camera 局部坐标系。
 
-    根据确定的六条轴向关系：
+    手机机体坐标系 = Android 传感器坐标系：
+        X 右 / Y 上 / Z 朝屏幕外
+
+    根据 getrotation.gd 使用的六条轴向关系：
 
     Camera -X -> Phone +Y
     Camera +X -> Phone -Y
@@ -51,9 +51,9 @@ def _phone_motion_to_camera_local(
     """
 
     return Vector((
-        -phone_motion.y,
-        phone_motion.x,
-        phone_motion.z,
+        -body_motion.y,
+        body_motion.x,
+        body_motion.z,
     ))
 
 
@@ -106,61 +106,34 @@ def handle_message(message):
             return
 
         try:
-            # 光流图像中的特征运动量，单位为像素。
-            flow_x = float(data["x"])
-            flow_y = float(data["y"])
-
-            # 径向光流：
-            # 正值表示画面整体扩张；
-            # 负值表示画面整体收缩。
-            radial = float(data["radial"])
+            # 手机机体坐标系下的位移增量，单位：米
+            # （由手机端 OpenVINS 提供，已是真实尺度）
+            body_x = float(data["x"])
+            body_y = float(data["y"])
+            body_z = float(data.get("z", 0.0))
 
         except (KeyError, TypeError, ValueError):
             print(
-                "[Blecaco][Free] Invalid optical flow data"
+                "[Blecaco][Free] Invalid translation data"
             )
             return
 
         # ----------------------------------------------------
-        # 2.1 将图像运动近似转换为手机的平移方向
-        # ----------------------------------------------------
-        #
-        # 此处假设：
-        # - flow_x > 0：图像特征向右移动
-        # - flow_y > 0：图像特征向下移动
-        # - radial > 0：图像向外扩张
-        #
-        # 对静止场景而言，图像运动方向通常与相机平移方向相反。
-        #
-        # 手机横屏且图像已经 auto_upright 时，
-        # 这里暂按输出图像 X/Y 对应手机 X/Y 的方式估算。
-        # 实际方向仍需通过手机移动测试验证。
-
-        phone_motion = Vector((
-            flow_y,
-            flow_x,
-            -radial,
-        ))
-
-        # ----------------------------------------------------
-        # 2.2 按指定的轴向关系转换到 Blender Camera 坐标系
+        # 2.1 手机机体坐标系 -> Blender Camera 局部坐标系
         # ----------------------------------------------------
 
-        camera_local_motion = (
-            _phone_motion_to_camera_local(phone_motion)
+        camera_local_motion = _phone_body_to_camera_local(
+            Vector((body_x, body_y, body_z))
         )
 
         # ----------------------------------------------------
-        # 2.3 缩放位移
+        # 2.2 缩放位移（单位已是米，默认 1:1）
         # ----------------------------------------------------
 
-        camera_local_motion *= (
-            FLOW_PIXEL_TO_BLENDER_UNITS
-            * move_scale_ratio
-        )
+        camera_local_motion *= move_scale_ratio
 
         # ----------------------------------------------------
-        # 2.4 将摄像机局部位移转换到世界坐标系
+        # 2.3 将摄像机局部位移转换到世界坐标系
         # ----------------------------------------------------
 
         camera_world_rotation = (
