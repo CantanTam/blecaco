@@ -137,8 +137,8 @@ def handle_message(message):
         # 实际方向仍需通过手机移动测试验证。
 
         phone_motion = Vector((
-            -flow_x,
             flow_y,
+            flow_x,
             -radial,
         ))
 
