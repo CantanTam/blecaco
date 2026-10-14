@@ -9,7 +9,7 @@ from mathutils import Quaternion, Vector
 # 平移比例：
 # 1.0 = 默认比例
 # 后续可以在 Blender 插件面板中添加可调选项。
-move_scale_ratio: float = 50.0
+move_scale_ratio: float = 10.0
 
 # 光流像素位移转换为 Blender 位移单位的基础比例。
 # 最终移动量 = 光流位移 × 此值 × move_scale_ratio
