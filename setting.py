@@ -60,13 +60,19 @@ def _record_camera_rotation():
             camera.rotation_mode = 'QUATERNION'
 
         # 在当前动画帧插入或更新旋转关键帧
-        inserted = camera.keyframe_insert(
+        rotation_inserted = camera.keyframe_insert(
             data_path="rotation_quaternion",
             frame=scene.frame_current,
-            group="Blecaco Free",
+            group="Blecaco Camera",
         )
 
-        if not inserted:
+        location_inserted = camera.keyframe_insert(
+            data_path="location",
+            frame=scene.frame_current,
+            group="Blecaco Camera",
+        )
+
+        if not rotation_inserted or not location_inserted:
             _record_warning(
                 "摄像机旋转关键帧插入失败，请检查摄像机是否可编辑"
             )

@@ -1,9 +1,11 @@
 import bpy
-from mathutils import Quaternion
-
+from mathutils import Quaternion, Vector
 
 # Plane Mode 摄像机初始旋转
 _initial_camera_rotation = None
+
+# Plane Mode 摄像机移动速度倍数
+PLANE_MOVE_SPEED_MULTIPLIER: float = 5.0
 
 
 def handle_message(message):
@@ -13,6 +15,24 @@ def handle_message(message):
 
     if not isinstance(data, dict):
         print("[Blecaco][Plane] Invalid data")
+        return
+    
+    # 前进：沿摄像头自身局部 Z 轴负方向移动
+    if data.get("command") == "forward":
+        camera = bpy.context.scene.camera
+
+        if camera is None:
+            print("[Blecaco][Plane] No active camera")
+            return
+
+        distance = (float(data.get("distance", 0.1)) * PLANE_MOVE_SPEED_MULTIPLIER)
+
+        world_matrix = camera.matrix_world.copy()
+        world_matrix.translation += (
+            world_matrix.to_quaternion()
+            @ Vector((0.0, 0.0, -distance))
+        )
+        camera.matrix_world = world_matrix
         return
 
     # 1. 初始化：记录摄像机初始旋转
