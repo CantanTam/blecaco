@@ -93,11 +93,14 @@ class BLECACO_PT_main_panel(bpy.types.Panel):
         #    注意别把 box 建在补内容之前，否则顺序会反。
         col = layout.column(align=True)
 
-        # 相机状态（无论是否运行都显示）
-        cam, err = streamer.get_active_camera()
-        if err:
-            col.label(text=err, icon="ERROR")
-        else:
+        # 相机状态（无论是否运行都显示）。
+        #
+        # ⚠️ 没有活动相机时**不再提示**了：手机上直接就能挑一台
+        #    （摄像机选择页，见 camera_select.tscn），
+        #    面板上再喊一句「没有活动 camera」纯属噪音。
+        cam, _err = streamer.get_active_camera()
+
+        if cam is not None:
             col.label(text=f"Camera: {cam.name}", icon="CAMERA_DATA")
 
         if status["running"]:

@@ -39,6 +39,10 @@ _last_output_fps = None
 # 之后只在被改动时再发。
 _last_stream_settings = None
 
+# 上一次同步给手机的摄像机状态（列表 + 活动摄像机）。
+# 新客户端接入时补发一次做基准，之后摄像机增删/改名/切活动都会再发。
+_last_camera_state = None
+
 
 def _get_output_fps():
     """Blender 的实际输出帧率（fps / fps_base，例如 23.976）。
@@ -137,6 +141,58 @@ def _apply_stream_setting(name, value):
     setattr(scene.blecaco, attr, number)
 
     print(f"[blecaco] 手机设置 {name} = {getattr(scene.blecaco, attr)}")
+    return True
+
+
+def _get_camera_state():
+    """当前场景里所有摄像机 + 哪一台是活动的。
+
+    返回 {"active": 名字或空串, "names": [名字...]}；取不到时返回 None。
+    """
+    scene = bpy.context.scene
+
+    if scene is None:
+        return None
+
+    try:
+        names = [obj.name for obj in scene.objects if obj.type == "CAMERA"]
+        active = scene.camera.name if scene.camera is not None else ""
+    except Exception:
+        return None
+
+    return {"active": active, "names": names}
+
+
+def _send_camera_state(state):
+    """把摄像机列表 + 活动摄像机同步给手机。"""
+    success = streamer.send_setting_to_clients("cameras", state)
+
+    if success:
+        print(
+            f"[blecaco] 已同步摄像机给手机："
+            f"{len(state['names'])} 台，活动 = {state['active'] or '（无）'}"
+        )
+
+    return success
+
+
+def _apply_active_camera(camera_name):
+    """手机点了某台摄像机 → 把它设为活动摄像机。成功返回 True。"""
+    scene = bpy.context.scene
+
+    if scene is None or not camera_name:
+        return False
+
+    obj = scene.objects.get(str(camera_name))
+
+    if obj is None or obj.type != "CAMERA":
+        print(f"[blecaco] 找不到摄像机：{camera_name!r}")
+        return False
+
+    if scene.camera != obj:
+        scene.camera = obj
+        print(f"[blecaco] 活动摄像机切换为：{obj.name}")
+
     return True
 
 
@@ -469,10 +525,10 @@ def _send_state(value):
 
 
 def handle_message(data):
-    """处理手机发来的设置：record 开关 + 三个推流参数。"""
+    """处理手机发来的设置：record 开关 + 推流参数 + 活动摄像机。"""
     global _last_state, _last_frame
     global _record_frame_min, _record_frame_max
-    global _last_stream_settings
+    global _last_stream_settings, _last_camera_state
 
     if data.get("type") != "setting":
         return
@@ -484,6 +540,25 @@ def handle_message(data):
     # 回执给手机 —— 一方面确认 Blender 收到了，另一方面两边不至于跑偏。
     if _apply_stream_setting(name, data.get("value")):
         _last_stream_settings = None
+        return
+
+    # 手机打开摄像机页时会来要一份列表（value 是 null）→ 立刻回推，
+    # 不等下一次 _watch_state 轮询，这样「打开页面就能看到」是确定的。
+    if name == "cameras":
+        camera_state = _get_camera_state()
+
+        if camera_state is not None:
+            _send_camera_state(camera_state)
+            _last_camera_state = camera_state
+
+        return
+
+    # 活动摄像机：手机在摄像机列表里点了某一台
+    if name == "active_camera":
+        if _apply_active_camera(data.get("value")):
+            # 同样清掉记录，下一轮把新的摄像机状态回执给手机
+            _last_camera_state = None
+
         return
 
     if name != "record":
@@ -548,7 +623,11 @@ def handle_message(data):
 
 
 def _watch_state():
+    # ⚠️ 下面每一条被赋值的全局都要在这里声明，漏一个就会在运行时抛
+    #    UnboundLocalError —— Blender 会把出错定时器直接注销，
+    #    于是所有「主动推送」集体静默失效（请求-响应因为不走这里，看起来还是正常的）。
     global _last_state, _last_clients, _last_output_fps
+    global _last_stream_settings, _last_camera_state
 
     state = _get_state()
 
@@ -606,6 +685,17 @@ def _watch_state():
         _send_stream_settings(stream_settings)
         _last_stream_settings = stream_settings
 
+    # 摄像机（列表 + 活动摄像机）：同样是新客户端接入时补发一次做基准。
+    # 摄像机被增删 / 改名 / 换活动，这个 state 都会变，所以手机那边
+    # 不需要额外请求就能实时更新。
+    camera_state = _get_camera_state()
+
+    if clients > 0 and camera_state is not None and (
+        camera_state != _last_camera_state or clients != _last_clients
+    ):
+        _send_camera_state(camera_state)
+        _last_camera_state = camera_state
+
     _last_state = state
     _last_clients = clients
 
@@ -614,7 +704,7 @@ def _watch_state():
 
 def register():
     global _last_state, _last_clients, _last_record_warning, _last_frame
-    global _last_output_fps, _last_stream_settings
+    global _last_output_fps, _last_stream_settings, _last_camera_state
 
     _last_state = None
     _last_clients = 0
@@ -622,6 +712,7 @@ def register():
     _last_frame = None
     _last_output_fps = None
     _last_stream_settings = None
+    _last_camera_state = None
 
     # 录制状态监测
     if not bpy.app.timers.is_registered(_watch_state):
