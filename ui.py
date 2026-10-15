@@ -86,6 +86,11 @@ class BLECACO_PT_main_panel(bpy.types.Panel):
         props = context.scene.blecaco
         status = streamer.get_status()
 
+        # 上半部分：相机 / 地址 / 推流按钮 —— 一个对齐列就够。
+        # ⚠️ Blender 是按「子布局被创建的先后」决定显示顺序的：
+        #    这两处 box 都挂在 layout 上、且在 col 之后创建，
+        #    所以它们一定排在列的下面。若以后要往 col 里补内容，
+        #    注意别把 box 建在补内容之前，否则顺序会反。
         col = layout.column(align=True)
 
         # 相机状态（无论是否运行都显示）
@@ -111,9 +116,16 @@ class BLECACO_PT_main_panel(bpy.types.Panel):
         else:
             col.operator("blecaco.start", icon="PLAY")
 
-        box = layout.box()
-        col = box.column(align=True)
+        # 下半部分：四个设置项单独包一个 box，
+        # 和上面的推流按钮 / 二维码区隔开。
+        options_box = layout.box()
+        options = options_box.column(align=True)
+
+        # 端口只在没推流时给改（推流中改它没有意义）
         if not status["running"]:
-            col.prop(props, "port")
-        col.prop(props, "fps")
-        col.prop(props, "quality")
+            options.prop(props, "port")
+
+        # 三个推流参数：和端口同一种样式（都带滑条）
+        options.prop(props, "fps")
+        options.prop(props, "quality")
+        options.prop(props, "smooth")

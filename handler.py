@@ -22,7 +22,7 @@ TIMER_INTERVAL = 0.01
 ACTION_MODULES = {
     "game": "game",
     "plane": "plane_action",
-    "car": "car",
+    "car": "car_action",
     "free": "free_action",
     "drone":"drone",
     "camera":"camera",

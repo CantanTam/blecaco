@@ -55,6 +55,11 @@ except ImportError:
     HAS_GPU = False
 
 
+# 逐条打印收到的消息会把控制台刷爆（旋转 + 位移合计可达 100~200 条/秒），
+# 而且每条都要多解析一次 JSON；排查时再改 True。
+VERBOSE_INBOUND_LOG: bool = False
+
+
 _HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -466,11 +471,10 @@ class _Server:
                     # 原始消息交给 handler.py，具体解析和分流由它负责
                     _message_handler.enqueue_message(message)
 
-                    # 保留控制台日志，方便调试
-                    try:
-                        print(f"[blecaco] 收到: {json.loads(message)}")
-                    except json.JSONDecodeError:
-                        print(f"[blecaco] 收到无效 JSON: {message}")
+                    # 逐条打印会明显拖慢接收（可达 100~200 条/秒），
+                    # JSON 解析失败由 handler._dispatch_message 负责报错。
+                    if VERBOSE_INBOUND_LOG:
+                        print(f"[blecaco] 收到: {message}")
 
         except Exception as exc:
             print(f"[blecaco] WebSocket 接收异常: {exc}")

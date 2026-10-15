@@ -8,6 +8,27 @@ _initial_camera_rotation = None
 PLANE_MOVE_SPEED_MULTIPLIER: float = 5.0
 
 
+def _move_forward(raw_distance: float) -> None:
+    """沿相机自身局部 -Z 方向前进。
+
+    只改 location，绝不写 matrix_world：
+    matrix_world 是聚合值，写它会把 location / rotation / scale 一起重写，
+    而 rotation 由姿态消息流专门负责，两者互相覆盖会让相机旋转来回跳。
+    （相机朝向 = 局部 -Z；rotation_quaternion 是最新的旋转值。）
+    """
+    camera = bpy.context.scene.camera
+
+    if camera is None:
+        print("[Blecaco][Plane] No active camera")
+        return
+
+    distance = raw_distance * PLANE_MOVE_SPEED_MULTIPLIER
+
+    camera.location = camera.location + (
+        camera.rotation_quaternion @ Vector((0.0, 0.0, -distance))
+    )
+
+
 def handle_message(message):
     global _initial_camera_rotation
 
@@ -17,22 +38,9 @@ def handle_message(message):
         print("[Blecaco][Plane] Invalid data")
         return
     
-    # 前进：沿摄像头自身局部 Z 轴负方向移动
+    # 兼容单独发送的 forward 消息（现在前进量已合并进姿态消息里）
     if data.get("command") == "forward":
-        camera = bpy.context.scene.camera
-
-        if camera is None:
-            print("[Blecaco][Plane] No active camera")
-            return
-
-        distance = (float(data.get("distance", 0.1)) * PLANE_MOVE_SPEED_MULTIPLIER)
-
-        world_matrix = camera.matrix_world.copy()
-        world_matrix.translation += (
-            world_matrix.to_quaternion()
-            @ Vector((0.0, 0.0, -distance))
-        )
-        camera.matrix_world = world_matrix
+        _move_forward(float(data.get("distance", 0.1)))
         return
 
     # 1. 初始化：记录摄像机初始旋转
@@ -91,3 +99,10 @@ def handle_message(message):
     camera.rotation_quaternion = (
         _initial_camera_rotation @ rotation
     )
+
+    # 同一条消息里带来的前进量（plane_mode.gd 合并发送）。
+    # 放在旋转之后：本帧的移动方向与刚设定的朝向一致。
+    forward = float(data.get("forward", 0.0))
+
+    if forward != 0.0:
+        _move_forward(forward)

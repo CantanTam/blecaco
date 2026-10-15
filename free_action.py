@@ -15,6 +15,10 @@ move_scale_ratio: float = 10.0
 # 最终移动量 = 光流位移 × 此值 × move_scale_ratio
 FLOW_PIXEL_TO_BLENDER_UNITS: float = 0.005
 
+# 打开后会以约 100Hz 往控制台刷每条四元数，明显拖慢 Blender 主线程；
+# 与 GDScript 侧的 VERBOSE_ORIENTATION_LOG / VERBOSE_SEND_LOG 同理，排查时再改 True。
+VERBOSE_ROTATION_LOG: bool = False
+
 
 # ============================================================
 # Free Mode 状态
@@ -172,11 +176,27 @@ def handle_message(message):
             @ camera_local_motion
         )
 
-        # 更新世界坐标位置。
-        # 使用 matrix_world，兼容摄像机存在父对象的情况。
-        world_matrix = camera.matrix_world.copy()
-        world_matrix.translation += world_motion
-        camera.matrix_world = world_matrix
+        # 只改 location，绝不写 matrix_world。
+        #
+        # matrix_world = ... 会把 location / rotation / scale 三个通道一起重写，
+        # 而 rotation 正被另一条约 100Hz 的旋转消息流写入；且 matrix_world 是
+        # depsgraph 求值时才刷新的缓存，读到的旋转是滞后的，于是位移消息会把
+        # 刚写入的旋转覆盖回旧值 —— 两条流互相覆盖，旋转就会来回跳。
+        # （plane_action.py 的 forward 分支是同一处修复。）
+        if camera.parent is not None:
+            # 有父级：把世界位移换算回 location 所在的父空间
+            parent_3x3 = (
+                camera.parent.matrix_world
+                @ camera.matrix_parent_inverse
+            ).to_3x3()
+
+            camera.location = (
+                camera.location
+                + (parent_3x3.inverted() @ world_motion)
+            )
+        else:
+            # 无父级：location 就是世界坐标，直接加世界位移
+            camera.location = camera.location + world_motion
 
         return
 
@@ -225,10 +245,11 @@ def handle_message(message):
         _initial_camera_rotation @ rotation
     )
 
-    print(
-        "[Blecaco][Free] Camera rotation updated: "
-        f"X={camera.rotation_quaternion.x:.4f}, "
-        f"Y={camera.rotation_quaternion.y:.4f}, "
-        f"Z={camera.rotation_quaternion.z:.4f}, "
-        f"W={camera.rotation_quaternion.w:.4f}"
-    )
+    if VERBOSE_ROTATION_LOG:
+        print(
+            "[Blecaco][Free] Camera rotation updated: "
+            f"X={camera.rotation_quaternion.x:.4f}, "
+            f"Y={camera.rotation_quaternion.y:.4f}, "
+            f"Z={camera.rotation_quaternion.z:.4f}, "
+            f"W={camera.rotation_quaternion.w:.4f}"
+        )
