@@ -119,7 +119,7 @@ class BLECACO_PT_main_panel(bpy.types.Panel):
         else:
             col.operator("blecaco.start", icon="PLAY")
 
-        # 下半部分：四个设置项单独包一个 box，
+        # 下半部分：推流设置项单独包一个 box，
         # 和上面的推流按钮 / 二维码区隔开。
         options_box = layout.box()
         options = options_box.column(align=True)
@@ -128,7 +128,8 @@ class BLECACO_PT_main_panel(bpy.types.Panel):
         if not status["running"]:
             options.prop(props, "port")
 
-        # 三个推流参数：和端口同一种样式（都带滑条）
+        # 推流参数：和端口同一种样式（都带滑条）
         options.prop(props, "fps")
+        options.prop(props, "width")
         options.prop(props, "quality")
         options.prop(props, "smooth")

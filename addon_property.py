@@ -6,6 +6,15 @@ class BLECACO_SceneProperties(bpy.types.PropertyGroup):
     fps: bpy.props.IntProperty(name="推流帧率", default=10, min=1, max=30)
     quality: bpy.props.IntProperty(name="推流画质", default=70, min=10, max=100)
 
+    # 推流画面的宽度（像素）：高度按相机画幅比例自动算，宽高都会取偶数。
+    width: bpy.props.IntProperty(
+        name="推流宽度",
+        description="推流画面的宽度（像素），高度按相机画幅自动算；越大越清晰，也越吃性能",
+        default=640,
+        min=160,
+        max=3840,
+    )
+
     # 停止录制后，对活动摄像机的关键帧曲线做一次平滑（0 = 关闭，不改变任何东西）
     smooth: bpy.props.FloatProperty(
         name="平滑程度",

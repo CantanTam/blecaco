@@ -85,13 +85,17 @@ def _send_output_fps(fps):
 # ⚠️ 必须和 blecaco/addon_property.py 里声明的范围保持一致。
 _STREAM_SETTERS = {
     "fps": ("fps", int, 1, 30),
+    "width": ("width", int, 160, 3840),
     "quality": ("quality", int, 10, 100),
     "smooth": ("smooth", float, 0.0, 1.0),
 }
 
 
 def _get_stream_settings():
-    """读取插件面板上的三个推流参数，读不到返回 None。"""
+    """读取插件面板上的四个推流参数，读不到返回 None。
+
+    ⚠️ 顺序必须和 _send_stream_settings() 的 names 一一对应。
+    """
     scene = bpy.context.scene
 
     if scene is None or not hasattr(scene, "blecaco"):
@@ -100,14 +104,19 @@ def _get_stream_settings():
     props = scene.blecaco
 
     try:
-        return (int(props.fps), int(props.quality), float(props.smooth))
+        return (
+            int(props.fps),
+            int(props.width),
+            int(props.quality),
+            float(props.smooth),
+        )
     except Exception:
         return None
 
 
 def _send_stream_settings(settings):
-    """把三个推流参数分别作为 fps / quality / smooth 发给手机。"""
-    names = ("fps", "quality", "smooth")
+    """把四个推流参数分别作为 fps / width / quality / smooth 发给手机。"""
+    names = ("fps", "width", "quality", "smooth")
     sent = 0
 
     for name, value in zip(names, settings):
@@ -117,7 +126,8 @@ def _send_stream_settings(settings):
     if sent == len(names):
         print(
             f"[blecaco] 已同步推流参数给手机："
-            f"fps={settings[0]}, quality={settings[1]}, smooth={settings[2]:g}"
+            f"fps={settings[0]}, width={settings[1]}, "
+            f"quality={settings[2]}, smooth={settings[3]:g}"
         )
 
     return sent == len(names)
