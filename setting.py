@@ -43,6 +43,11 @@ _last_stream_settings = None
 # 新客户端接入时补发一次做基准，之后摄像机增删/改名/切活动都会再发。
 _last_camera_state = None
 
+# 上一次同步给手机的 3D 视图着色状态（X-Ray 开关 + 着色方式）。
+# 同样：新客户端接入时补发一次做基准，之后只在这两个值被改动时再发 ——
+# 手机按按钮、或者用户在 Blender 里自己点 X-Ray / 改着色方式，都会再发。
+_last_shading_state = None
+
 
 def _get_output_fps():
     """Blender 的实际输出帧率（fps / fps_base，例如 23.976）。
@@ -194,6 +199,173 @@ def _apply_active_camera(camera_name):
         print(f"[blecaco] 活动摄像机切换为：{obj.name}")
 
     return True
+
+
+# ==============================================================
+# 3D 视图着色方式 / X-Ray
+#
+# 手机「着色设置页」底部那五个圆按钮对应这里：
+#     XRay            → X-Ray 开关（Blender 是开关，所以走 toggle）
+#     ShadingWire     → shading.type = 'WIREFRAME'
+#     ShadingSolid    → shading.type = 'SOLID'
+#     ShadingTexture  → shading.type = 'MATERIAL'   ← 按钮叫 Texture，
+#                                                    对应 Blender 的材质预览
+#     ShadingRendered → shading.type = 'RENDERED'
+#
+# 两个方向都是实时的：
+#     手机按按钮  → handle_message → _apply_shading → 立刻回推（见那边）
+#     Blender 里改 → _watch_state 每 0.1 秒发现 → 推给手机
+# 新客户端（手机刚扫完二维码）接入时也会整组补发一次做基准。
+# ==============================================================
+
+# 手机能选的着色方式，取值就是 shading.type 自己的枚举名。
+_SHADING_TYPES = ("WIREFRAME", "SOLID", "MATERIAL", "RENDERED")
+
+# 手机发的 value 用这个表示「切换 X-Ray」（和按钮名一致）。
+_SHADING_XRAY = "XRAY"
+
+
+def _view3d_areas():
+    """当前窗口里所有 3D 视图区域。没有（例如后台跑）时返回空列表。"""
+    window = bpy.context.window
+
+    if window is None or window.screen is None:
+        return []
+
+    return [area for area in window.screen.areas if area.type == "VIEW_3D"]
+
+
+def _get_shading_state():
+    """当前 3D 视图的着色状态。
+
+    返回 {"xray": 开关, "shading": "SOLID"} 这样的字典；取不到时返回 None。
+
+    ⚠️ X-Ray 有两个开关，读哪个取决于当前着色方式（实测 Blender 5.2）：
+        线框   WIREFRAME          → shading.show_xray_wireframe
+        其它   SOLID/MATERIAL/…   → shading.show_xray
+        bpy.ops.view3d.toggle_xray() 翻的就是这两者中「当前这个」，
+        标准头部的 X-Ray 按钮显示的也是它 —— 所以手机那边要跟着读同一个，
+        否则在线框模式下点 X-Ray，手机永远看不到变化。
+    ⚠️ 多个 3D 视图时以第一个为准（手机按下按钮时是全都改，
+       所以正常情况下它们是一致的）。
+    """
+    areas = _view3d_areas()
+
+    if not areas:
+        return None
+
+    try:
+        shading = areas[0].spaces.active.shading
+
+        if str(shading.type) == "WIREFRAME":
+            xray = bool(shading.show_xray_wireframe)
+        else:
+            xray = bool(shading.show_xray)
+
+        return {
+            "xray": xray,
+            "shading": str(shading.type),
+        }
+    except Exception:
+        return None
+
+
+def _send_shading_state(state):
+    """把着色状态同步给手机。"""
+    success = streamer.send_setting_to_clients("shading", state)
+
+    if success:
+        print(
+            f"[blecaco] 已同步着色方式给手机：{state['shading']}，"
+            f"X-Ray {'开' if state['xray'] else '关'}"
+        )
+
+    return success
+
+
+def _toggle_xray():
+    """切换 X-Ray。成功返回 True。"""
+    areas = _view3d_areas()
+
+    if not areas:
+        print("[blecaco] 当前窗口没有 3D 视图，X-Ray 没切")
+        return False
+
+    window = bpy.context.window
+    toggled = 0
+
+    # 逐个 3D 视图调用，多个视图时一起跟着手机走（和改着色方式一致）。
+    for area in areas:
+        region = next(
+            (r for r in area.regions if r.type == "WINDOW"), None
+        )
+
+        try:
+            # ⚠️ 必须补 area / region：
+            #    这个操作符是从定时器里调的（不在 3D 视图自己的事件/绘制流程里），
+            #    Blender 算出来的 context 里没有 3D 视图，操作符会直接 CANCELLED。
+            with bpy.context.temp_override(
+                window=window,
+                screen=window.screen,
+                area=area,
+                region=region,
+            ):
+                result = bpy.ops.view3d.toggle_xray()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            continue
+
+        if "FINISHED" in result:
+            toggled += 1
+        else:
+            print(f"[blecaco] X-Ray 切换被取消：{result}")
+
+    if toggled:
+        print("[blecaco] X-Ray 已切换")
+
+    return toggled > 0
+
+
+def _apply_shading(value):
+    """手机按了着色按钮 → 改 Blender 的 3D 视图。成功返回 True。"""
+    if not isinstance(value, str):
+        print(f"[blecaco] 着色方式的取值不对：{value!r}")
+        return False
+
+    key = value.upper()
+
+    if key == _SHADING_XRAY:
+        return _toggle_xray()
+
+    if key not in _SHADING_TYPES:
+        print(f"[blecaco] 不认识的着色方式：{value!r}")
+        return False
+
+    areas = _view3d_areas()
+
+    if not areas:
+        print("[blecaco] 当前窗口没有 3D 视图，着色方式没改")
+        return False
+
+    for area in areas:
+        area.spaces.active.shading.type = key
+
+    print(f"[blecaco] 着色方式切换为：{key}")
+    return True
+
+
+def _push_shading_state():
+    """读一次当前着色状态并推给手机。取不到状态时什么都不做。"""
+    global _last_shading_state
+
+    state = _get_shading_state()
+
+    if state is None:
+        return
+
+    _send_shading_state(state)
+    _last_shading_state = state
 
 
 def _get_state():
@@ -561,6 +733,22 @@ def handle_message(data):
 
         return
 
+    # 着色方式 / X-Ray：手机按了着色设置页底部的圆按钮。
+    #
+    # ⚠️ 处理完**立刻**回推一次（不等 _watch_state 下一轮）：
+    #    手机那边不做乐观更新，按钮状态完全跟着 Blender 走，
+    #    立刻回推才能保证「按下去之后按钮确实是这个状态」是确定的
+    #    （例如没有 3D 视图、操作被取消时，手机也能马上回到真实状态）。
+    if name == "shading":
+        value = data.get("value")
+
+        # value 为 null = 手机打开着色页时来要一份当前状态 → 只回推，不改任何东西
+        if value is not None:
+            _apply_shading(value)
+
+        _push_shading_state()
+        return
+
     if name != "record":
         return
 
@@ -627,7 +815,7 @@ def _watch_state():
     #    UnboundLocalError —— Blender 会把出错定时器直接注销，
     #    于是所有「主动推送」集体静默失效（请求-响应因为不走这里，看起来还是正常的）。
     global _last_state, _last_clients, _last_output_fps
-    global _last_stream_settings, _last_camera_state
+    global _last_stream_settings, _last_camera_state, _last_shading_state
 
     state = _get_state()
 
@@ -696,6 +884,19 @@ def _watch_state():
         _send_camera_state(camera_state)
         _last_camera_state = camera_state
 
+    # 3D 视图着色方式 / X-Ray：同样是新客户端接入时补发一次做基准。
+    # 这就是需求里那句「手机扫完二维码先以 Blender 状态为准同步一次」。
+    #
+    # 之后用户在 Blender 里自己点 X-Ray / 改着色方式，这个 state 就会变，
+    # 手机那边不需要额外请求就能实时跟上（0.1 秒一轮）。
+    shading_state = _get_shading_state()
+
+    if clients > 0 and shading_state is not None and (
+        shading_state != _last_shading_state or clients != _last_clients
+    ):
+        _send_shading_state(shading_state)
+        _last_shading_state = shading_state
+
     _last_state = state
     _last_clients = clients
 
@@ -705,6 +906,7 @@ def _watch_state():
 def register():
     global _last_state, _last_clients, _last_record_warning, _last_frame
     global _last_output_fps, _last_stream_settings, _last_camera_state
+    global _last_shading_state
 
     _last_state = None
     _last_clients = 0
@@ -713,6 +915,7 @@ def register():
     _last_output_fps = None
     _last_stream_settings = None
     _last_camera_state = None
+    _last_shading_state = None
 
     # 录制状态监测
     if not bpy.app.timers.is_registered(_watch_state):
