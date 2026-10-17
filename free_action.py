@@ -11,6 +11,14 @@ from mathutils import Quaternion, Vector
 # 后续可以在 Blender 插件面板中添加可调选项。
 move_scale_ratio: float = 10.0
 
+
+#: OpenVINS 输出的是**米**。注意这里会和 move_scale_ratio 相乘：
+#:   有效比例 = METER_TO_BLENDER_UNITS × move_scale_ratio
+#: 默认 0.1 × 10 = **1.0** → 手机移动 1 米 = Blender 里移动 1 单位（1:1，手感直观）。
+#: 想要更灵敏/更迟钝，改这个值或全局的 move_scale_ratio 都行。
+#: 光流那条路仍走 FLOW_PIXEL_TO_BLENDER_UNITS（像素→Blender 单位），互不影响。
+METER_TO_BLENDER_UNITS: float = 0.1
+
 # 光流像素位移转换为 Blender 位移单位的基础比例。
 # 最终移动量 = 光流位移 × 此值 × move_scale_ratio
 FLOW_PIXEL_TO_BLENDER_UNITS: float = 0.005
@@ -26,6 +34,11 @@ VERBOSE_ROTATION_LOG: bool = False
 
 # 进入 Free Mode 时记录的摄像机初始旋转。
 _initial_camera_rotation = None
+
+#: LinkButton 切到 unlink 时保存的**相机**旋转四元数。
+#: 重新 link 时把它作为新的「初始相机旋转」基准，这样手机在被暂停期间怎么转，
+#: 恢复后相机都不会跳 —— 只把手机「当前姿态」当成新的零点。
+_saved_camera_rotation = None
 
 
 # ============================================================
@@ -67,6 +80,7 @@ def _phone_motion_to_camera_local(
 
 def handle_message(message):
     global _initial_camera_rotation
+    global _saved_camera_rotation
 
     data = message.get("data", {})
 
@@ -97,6 +111,65 @@ def handle_message(message):
         return
 
     # --------------------------------------------------------
+    # 1.1 LinkButton 切到 unlink：先记下相机当前的旋转
+    #     （手机端会在**暂停发送之前**发这条，否则会被 action 门控丢掉）
+    # --------------------------------------------------------
+
+    if data.get("command") == "unlink":
+        camera = bpy.context.scene.camera
+
+        if camera is None:
+            print("[Blecaco][Free] No active camera")
+            return
+
+        camera.rotation_mode = 'QUATERNION'
+        _saved_camera_rotation = camera.rotation_quaternion.copy()
+
+        print(
+            "[Blecaco][Free] Unlink: saved camera rotation = "
+            f"X={_saved_camera_rotation.x:.4f}, "
+            f"Y={_saved_camera_rotation.y:.4f}, "
+            f"Z={_saved_camera_rotation.z:.4f}, "
+            f"W={_saved_camera_rotation.w:.4f}"
+        )
+        return
+
+    # --------------------------------------------------------
+    # 1.2 LinkButton 切回 link：用保存的相机旋转当新的初始基准
+    #     （手机端此刻已重新校准，之后发来的旋转是「相对当前姿态」的）
+    # --------------------------------------------------------
+
+    if data.get("command") == "relink":
+        camera = bpy.context.scene.camera
+
+        if camera is None:
+            print("[Blecaco][Free] No active camera")
+            return
+
+        camera.rotation_mode = 'QUATERNION'
+
+        if _saved_camera_rotation is None:
+            # 没保存过（例如没走 unlink 就直接恢复）：退化成以相机当前旋转为基准
+            _initial_camera_rotation = camera.rotation_quaternion.copy()
+            print(
+                "[Blecaco][Free] Relink: no saved rotation, "
+                "using current camera rotation as baseline"
+            )
+            return
+
+        _initial_camera_rotation = _saved_camera_rotation.copy()
+        camera.rotation_quaternion = _initial_camera_rotation.copy()
+
+        print(
+            "[Blecaco][Free] Relink: camera rotation restored to saved baseline "
+            f"X={_initial_camera_rotation.x:.4f}, "
+            f"Y={_initial_camera_rotation.y:.4f}, "
+            f"Z={_initial_camera_rotation.z:.4f}, "
+            f"W={_initial_camera_rotation.w:.4f}"
+        )
+        return
+
+    # --------------------------------------------------------
     # 2. 光流平移
     # --------------------------------------------------------
 
@@ -109,15 +182,25 @@ def handle_message(message):
             )
             return
 
-        try:
-            # 光流图像中的特征运动量，单位为像素。
-            flow_x = float(data["x"])
-            flow_y = float(data["y"])
+        # 位姿来源：光流（像素，默认） / OpenVINS（米）
+        # 手机端切到 OpenVINS 时会带 "unit": "meter"；不带该字段 = 老的光流路径。
+        unit = str(data.get("unit", "pixel"))
 
-            # 径向光流：
-            # 正值表示画面整体扩张；
-            # 负值表示画面整体收缩。
-            radial = float(data["radial"])
+        try:
+            if unit == "meter":
+                # OpenVINS：机体系下的米制**相对**位移（x 右 / y 下 / z 前）
+                flow_x = float(data.get("x", 0.0))
+                flow_y = float(data.get("y", 0.0))
+                radial = float(data.get("z", 0.0))
+            else:
+                # 光流图像中的特征运动量，单位为像素。
+                flow_x = float(data["x"])
+                flow_y = float(data["y"])
+
+                # 径向光流：
+                # 正值表示画面整体扩张；
+                # 负值表示画面整体收缩。
+                radial = float(data["radial"])
 
         except (KeyError, TypeError, ValueError):
             print(
@@ -159,7 +242,11 @@ def handle_message(message):
         # ----------------------------------------------------
 
         camera_local_motion *= (
-            FLOW_PIXEL_TO_BLENDER_UNITS
+            (
+                METER_TO_BLENDER_UNITS
+                if unit == "meter"
+                else FLOW_PIXEL_TO_BLENDER_UNITS
+            )
             * move_scale_ratio
         )
 
