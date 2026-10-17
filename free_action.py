@@ -1,5 +1,6 @@
 import bpy
-from mathutils import Quaternion, Vector
+from math import cos, radians, sin
+from mathutils import Matrix, Quaternion, Vector
 
 
 # ============================================================
@@ -18,6 +19,48 @@ move_scale_ratio: float = 10.0
 #: 想要更灵敏/更迟钝，改这个值或全局的 move_scale_ratio 都行。
 #: 光流那条路仍走 FLOW_PIXEL_TO_BLENDER_UNITS（像素→Blender 单位），互不影响。
 METER_TO_BLENDER_UNITS: float = 0.1
+
+# ============================================================
+# ★★ OpenVINS 相机系 → Blender 相机局部系 的 3x3 映射矩阵 ★★
+# ============================================================
+# 行 = Blender 相机局部轴（X 右 / Y 上 / Z 后）
+# 列 = OpenVINS 相机系轴（x 右 / y 下 / z 前，单位米，机体系帧间增量）
+#
+# 每个元素只能是 0 / +1 / -1 之类，方便表达「换轴」和「翻符号」两种修正：
+#   例：若发现 Blender 的 Y 应该来自 OpenVINS 的 z 且要取反 →
+#       第一行不变，第二行改成 (0.0, 0.0, -1.0)
+#
+# 当前值 = 单位矩阵（等价于"原样透传"）。
+# 说明：本 App **限定横屏**使用（横屏才能扫二维码），所以这里按你实测的
+#      横屏持机方向标定一次即可，不需要支持竖屏。
+METER_CAM_TO_BLENDER: tuple = (
+    (1.0,  0.0, 0.0),     # Blender X ← +cam.x
+    (0.0, -1.0, 0.0),     # Blender Y ← -cam.y
+    (0.0,  0.0, -1.0),    # Blender Z ← -cam.z
+)
+
+# 怎么来的（推导，2026-10-17）：
+#   ① 用户给的「手机屏幕系 → Blender 相机系」：
+#        camera.x = -phone.y ; camera.y = +phone.x ; camera.z = +phone.z
+#   ② OpenVINS 发来的是**图像(相机)系**，与手机屏幕系的关系：
+#        图像 z 指向场景内  = -phone.z        （屏幕 +z 指向用户）
+#       横屏(sensorOrientation=90)下 图像 x/y 与屏幕 x/y 交换并带符号
+#   ③ 合成（det=+1 的纯旋转）得到上表：cam.x→+X, cam.y→-Y, cam.z→-Z
+#      这也正好是「OpenCV 相机系 → Blender 相机局部系」的标准换算。
+# ============================================================
+# ★★★ 若方向仍不对：只改下面这一个数（0 / 90 / 180 / 270）★★★
+# ============================================================
+# 为什么需要它：手机侧发给 Blender 的是 **OpenVINS 相机(图像)系** 的位移
+# （图像系：x 右 / y 下 / z 前），而上面那张表是 **手机屏幕系 → Blender 相机系**。
+# 横屏使用时，图像系与屏幕系相差一个 90° 的整数倍（取决于相机 sensorOrientation
+# 与当时的屏幕旋转方向），所以先绕 z 轴把这个角度转掉，再套上表。
+#
+# 用法：默认 0。若方向不对，依次试 90 / 180 / 270（改完在 Blender 里重载插件即可，
+# 不需要重编/重装手机 App）。四个值覆盖全部可能。
+METER_PRE_ROTATE_DEG: float = 0.0
+
+# 只在第一条米制消息时提示一次当前映射，方便排查
+_meter_map_logged = False
 
 # 光流像素位移转换为 Blender 位移单位的基础比例。
 # 最终移动量 = 光流位移 × 此值 × move_scale_ratio
@@ -189,9 +232,9 @@ def handle_message(message):
         try:
             if unit == "meter":
                 # OpenVINS：机体系下的米制**相对**位移（x 右 / y 下 / z 前）
-                flow_x = float(data.get("x", 0.0))
-                flow_y = float(data.get("y", 0.0))
-                radial = float(data.get("z", 0.0))
+                meter_x = float(data.get("x", 0.0))
+                meter_y = float(data.get("y", 0.0))
+                meter_z = float(data.get("z", 0.0))
             else:
                 # 光流图像中的特征运动量，单位为像素。
                 flow_x = float(data["x"])
@@ -222,6 +265,61 @@ def handle_message(message):
         # 手机横屏且图像已经 auto_upright 时，
         # 这里暂按输出图像 X/Y 对应手机 X/Y 的方式估算。
         # 实际方向仍需通过手机移动测试验证。
+
+        if unit == "meter":
+            # 米制路径：直接逐轴映射到 Blender 相机局部系。
+            # 注意**不能**套用上面光流那套「图像运动与相机平移相反」的处理 ——
+            # 光流给的是图像特征位移，OpenVINS 给的是相机本身的位移，语义完全不同。
+            global _meter_map_logged
+            if not _meter_map_logged:
+                _meter_map_logged = True
+                print(
+                    "[Blecaco][Free] meter 映射 = "
+                    f"{METER_CAM_TO_BLENDER} 预旋转 = {METER_PRE_ROTATE_DEG}°"
+                )
+
+            v_cam = Vector((meter_x, meter_y, meter_z))
+
+            # 图像系 → 屏幕系：绕 z 轴预旋转（METER_PRE_ROTATE_DEG）
+            if METER_PRE_ROTATE_DEG:
+                rad = radians(METER_PRE_ROTATE_DEG)
+                c, s_ = cos(rad), sin(rad)
+                v_cam = Vector((
+                    v_cam.x * c - v_cam.y * s_,
+                    v_cam.x * s_ + v_cam.y * c,
+                    v_cam.z,
+                ))
+
+            # 屏幕系 → Blender 相机局部系（用户实测的固定对应关系）
+            camera_local_motion = Matrix(METER_CAM_TO_BLENDER) @ v_cam
+
+            camera_local_motion *= (
+                METER_TO_BLENDER_UNITS
+                * move_scale_ratio
+            )
+
+            camera_world_rotation = (
+                camera.matrix_world.to_quaternion()
+            )
+
+            world_motion = (
+                camera_world_rotation
+                @ camera_local_motion
+            )
+
+            if camera.parent is not None:
+                parent_3x3 = (
+                    camera.parent.matrix_world
+                    @ camera.matrix_parent_inverse
+                ).to_3x3()
+                camera.location = (
+                    camera.location
+                    + (parent_3x3.inverted() @ world_motion)
+                )
+            else:
+                camera.location = camera.location + world_motion
+
+            return
 
         phone_motion = Vector((
             flow_y,
