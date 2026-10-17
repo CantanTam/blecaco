@@ -21,9 +21,33 @@ _last_frame = None
 _record_frame_min = None
 _record_frame_max = None
 
-# 录制时约每秒检查 100 次；未录制时降低检查频率
-_RECORD_INTERVAL = 0.01
+# 未录制时的轮询间隔
 _IDLE_INTERVAL = 0.05
+
+# 录制定时器的心跳 = 帧间隔 × 该系数（<1 保证每个动画帧都能采到样本）。
+# 实际间隔由 _record_interval() 按项目帧率动态算，这里只是兜底常量。
+_RECORD_INTERVAL = 0.01
+_RECORD_INTERVAL_FACTOR = 0.5
+_RECORD_INTERVAL_MIN = 0.004
+_RECORD_INTERVAL_MAX = 0.2
+
+# 是否正在录制（本插件自己的状态，不再借用 Auto Keying）
+_recording = False
+# 录制前用户原本的 Auto Keying 设置（录制期间强制关闭，停止时还原）
+_prev_auto_key = None
+# 录制缓冲：[(frame, (x, y, z), (w, x, y, z))]
+_samples = []
+# 上一次 take 的信息（用于"拖平滑滑块实时重算曲线"）
+_take_camera = None
+_take_number = 1
+_take_raw_action = None      # 原始数据（平滑=0）曲线
+_take_tuned_action = None    # 按 UI 平滑值生成的曲线
+_take_live_strength = None   # 当前曲线对应的平滑值
+# 实时重算的节流（秒），避免拖动滑块时每像素都重算
+_LIVE_SMOOTH_DEBOUNCE = 0.15
+_live_smooth_timer = 0.0
+# 惰性恢复的扫描节流
+_restore_timer = 0.0
 
 # 停止录制后，把本次生成的关键帧插值改成 LINEAR。
 #   默认 False：保留 Blender 默认的 Bezier，与既有录像观感一致。
@@ -379,16 +403,47 @@ def _push_shading_state():
 
 
 def _get_state():
+    """当前是否"录制中且时间轴在播放"。
+
+    ⚠️ 不再依赖 Auto Keying：录制由本插件的定时器**采样**驱动，
+    录制期间还会强制关闭 Auto Keying（避免它把其它被选中的 object 也录进去）。
+    """
     scene = bpy.context.scene
     window = bpy.context.window
 
     if scene is None or window is None or window.screen is None:
         return False
 
-    return bool(
-        scene.tool_settings.use_keyframe_insert_auto
-        and window.screen.is_animation_playing
-    )
+    return bool(_recording and window.screen.is_animation_playing)
+
+
+def _record_interval() -> float:
+    """录制定时器的心跳间隔（秒）：跟随项目帧率（帧间隔 × 0.5）。
+
+    采样本身是"每个动画帧一个样本"，所以**采样频率 = 项目帧率**；
+    定时器心跳比帧间隔更快一半，只是保证不会漏掉任何一帧。
+    """
+    fps = 24.0
+
+    # ⚠️ 这个函数会在**插件注册时**被调用（定时器 first_interval），
+    #    那时 bpy.context.scene 可能不可用 —— 必须整段包在 try 里。
+    try:
+        scene = bpy.context.scene
+        if scene is not None:
+            render = scene.render
+            fps = (
+                render.fps / render.fps_base
+                if render.fps_base else float(render.fps)
+            )
+    except Exception:
+        fps = 24.0
+
+    if fps <= 0.0:
+        fps = 24.0
+
+    interval = (1.0 / fps) * _RECORD_INTERVAL_FACTOR
+
+    return max(_RECORD_INTERVAL_MIN, min(_RECORD_INTERVAL_MAX, interval))
 
 
 def _record_warning(message):
@@ -412,17 +467,16 @@ def _note_recorded_frame(frame):
 
 
 def _record_camera_rotation():
-    """录制期间把活动摄像机的姿态写入当前动画帧。
+    """录制：**每个动画帧**把活动摄像机的位姿采样进内存（不写任何关键帧）。
 
-    只在「帧号发生变化」时才真正插入关键帧：
-    时间轴按场景帧率前进（默认 24fps），而这个定时器名义 100Hz，
-    不做这个判断的话同一帧会被重复插入 3~4 次 —— 每次插入都要在
-    F-Curve 里定位并标记 depsgraph，纯属浪费；录久了曲线越来越大，
-    还会让每一帧都重新求解动画，形成「越录越卡」。
+    设计要点（对应用户要求）：
+    1. 只读 scene.camera 的 location 与 rotation_quaternion，不碰其它 object ✓
+    2. 采样频率 = 项目帧率：靠"帧号变化才采样"保证**每帧恰好一个样本** ✓
+    3. 录制中不写关键帧 → 不触发 depsgraph 重算 → 视窗不会再把实时姿态
+       拉回上一帧的关键帧值（消除"闪烁"）✓；曲线在停止录制时一次性写入。
     """
     global _last_record_warning, _last_frame
 
-    # 必须同时开启 Auto Keying 和动画播放
     if not _get_state():
         return _IDLE_INTERVAL
 
@@ -431,16 +485,15 @@ def _record_camera_rotation():
     if scene is None:
         return _IDLE_INTERVAL
 
-    # 同一帧只插一次
     frame = scene.frame_current
 
+    # 同一帧只采样一次（定时器心跳比帧率快，这里把它折算成"每帧一次"）
     if frame == _last_frame:
-        return _RECORD_INTERVAL
+        return _record_interval()
 
     _last_frame = frame
-    _note_recorded_frame(frame)
 
-    # 使用当前场景的活动摄像机
+    # 只录制当前场景的活动摄像机
     camera = scene.camera
 
     if camera is None:
@@ -448,36 +501,635 @@ def _record_camera_rotation():
         return _IDLE_INTERVAL
 
     try:
-        # Blecaco 使用四元数记录旋转
+        # Blecaco 统一用四元数记录旋转（WXYZ）
         if camera.rotation_mode != 'QUATERNION':
             camera.rotation_mode = 'QUATERNION'
 
-        # 在当前动画帧插入或更新关键帧
-        rotation_inserted = camera.keyframe_insert(
-            data_path="rotation_quaternion",
-            frame=frame,
-            group="Blecaco Camera",
-        )
+        p = camera.location
+        q = camera.rotation_quaternion
 
-        location_inserted = camera.keyframe_insert(
-            data_path="location",
-            frame=frame,
-            group="Blecaco Camera",
-        )
-
-        if not rotation_inserted or not location_inserted:
-            _record_warning(
-                "摄像机旋转关键帧插入失败，请检查摄像机是否可编辑"
+        _samples.append(
+            (
+                int(frame),
+                (float(p.x), float(p.y), float(p.z)),
+                (float(q.w), float(q.x), float(q.y), float(q.z)),
             )
-        else:
-            _last_record_warning = None
+        )
+        _note_recorded_frame(frame)
+        _last_record_warning = None
 
     except Exception:
         import traceback
         traceback.print_exc()
 
-    return _RECORD_INTERVAL
+    return _record_interval()
 
+
+def _smooth_samples(samples, strength):
+    """对采样做二项式加权滑动平均（位置 XYZ + 四元数 WXYZ）。
+
+    四元数：先做符号对齐（相邻点 dot<0 就整体取反）→ 分量平滑 → 重新归一化，
+    避免 q / -q 之间的"抽动"，与原有曲线平滑的思路一致。
+    strength: 0~1，0 表示不平滑（原始）。
+    """
+    if strength <= 0.0 or len(samples) < 3:
+        return list(samples)
+
+    radius = 1 + int(round(float(strength) * (_MAX_SMOOTH_RADIUS - 1)))
+
+    if radius <= 0:
+        return list(samples)
+
+    weights = _binomial_weights(radius)
+    count = len(samples)
+
+    def smooth_component(values):
+        out = []
+
+        for i in range(len(values)):
+            acc = 0.0
+            wsum = 0.0
+
+            for k, w in enumerate(weights):
+                j = i + k - radius
+
+                if 0 <= j < len(values):
+                    acc += values[j] * w
+                    wsum += w
+
+            out.append(acc / wsum if wsum > 0.0 else values[i])
+
+        return out
+
+    # ① 四元数符号对齐
+    quats = [s[2] for s in samples]
+
+    for i in range(1, count):
+        prev = quats[i - 1]
+        cur = quats[i]
+        dot = sum(prev[c] * cur[c] for c in range(4))
+
+        if dot < 0.0:
+            quats[i] = tuple(-v for v in cur)
+
+    # ② 分量平滑
+    loc_comp = [smooth_component([s[1][c] for s in samples]) for c in range(3)]
+    quat_comp = [smooth_component([q[c] for q in quats]) for c in range(4)]
+
+    # ③ 四元数重新归一化
+    out = []
+
+    for i in range(count):
+        frame = samples[i][0]
+        loc = (loc_comp[0][i], loc_comp[1][i], loc_comp[2][i])
+        quat = [quat_comp[c][i] for c in range(4)]
+        norm = math.sqrt(sum(v * v for v in quat))
+
+        if norm <= 1e-9:
+            quat = samples[i][2]
+        else:
+            quat = tuple(v / norm for v in quat)
+
+        out.append((frame, loc, quat))
+
+    return out
+
+
+def _write_action(camera, name, samples, linear=False):
+    """把样本**批量**写成一条新 Action：location(3) + rotation_quaternion(4)。
+
+    只用 Blender 的批量接口（keyframe_points.foreach_set），比逐帧
+    keyframe_insert 快一个量级；且只作用于传入的 camera，不碰其它 object。
+    """
+    if not samples:
+        return None
+
+    anim = camera.animation_data or camera.animation_data_create()
+    action = bpy.data.actions.new(name)
+    action.use_fake_user = True
+
+    # Blender 4.4+/5.x 的分层 Action：需要显式创建并绑定槽位
+    slot = None
+
+    try:
+        slot = action.slots.new(id_type='OBJECT', name=camera.name)
+    except Exception:
+        slot = None
+
+    anim.action = action
+
+    if slot is not None:
+        try:
+            anim.action_slot = slot
+        except Exception:
+            pass
+
+    frames = [float(s[0]) for s in samples]
+
+    def add_curve(container, data_path, index, values):
+        fcurve = container.fcurves.new(data_path, index=index)
+        fcurve.keyframe_points.add(len(values))
+
+        flat = []
+        for f, v in zip(frames, values):
+            flat.append(f)
+            flat.append(float(v))
+
+        fcurve.keyframe_points.foreach_set("co", flat)
+
+        if linear:
+            for point in fcurve.keyframe_points:
+                point.interpolation = 'LINEAR'
+
+        fcurve.update()
+        return fcurve
+
+    # 分层 Action（新版本）→ 失败则回退到旧版 action.fcurves
+    container = None
+
+    try:
+        layer = action.layers.new("Layer")
+        strip = layer.strips.new(type='KEYFRAME')
+        container = strip.channelbag(anim.action_slot, ensure=True)
+    except Exception:
+        container = action
+
+    for i in range(3):
+        add_curve(container, "location", i, [s[1][i] for s in samples])
+
+    for i in range(4):
+        add_curve(container, "rotation_quaternion", i, [s[2][i] for s in samples])
+
+    return action
+
+
+def _rewrite_action(action, samples, linear=False):
+    """把样本**原地**重写进已有 Action 的 F-Curve（不新建 Action）。
+
+    用于"拖动平滑滑块实时重算"：每秒可能调用数次，必须快且不产生垃圾数据。
+    """
+    if action is None or not samples:
+        return False
+
+    frames = [float(s[0]) for s in samples]
+    count = len(samples)
+
+    def fill(fcurve, values):
+        fcurve.keyframe_points.clear()
+        fcurve.keyframe_points.add(count)
+
+        flat = []
+        for f, v in zip(frames, values):
+            flat.append(f)
+            flat.append(float(v))
+
+        fcurve.keyframe_points.foreach_set("co", flat)
+
+        if linear:
+            for point in fcurve.keyframe_points:
+                point.interpolation = 'LINEAR'
+
+        fcurve.update()
+
+    # 找到这条 Action 的 fcurve 容器（新版本是 channelbag，旧版是 action.fcurves）
+    containers = []
+
+    try:
+        if hasattr(action, "layers") and len(action.layers) > 0:
+            strip = action.layers[0].strips[0]
+
+            for slot in action.slots:
+                try:
+                    cb = strip.channelbag(slot, ensure=True)
+
+                    if cb is not None:
+                        containers.append(cb)
+                except Exception:
+                    pass
+        else:
+            containers.append(action)
+    except Exception:
+        containers.append(action)
+
+    wrote = 0
+
+    for container in containers:
+        for fcurve in container.fcurves:
+            if fcurve.data_path == "location" and 0 <= fcurve.array_index < 3:
+                fill(fcurve, [s[1][fcurve.array_index] for s in samples])
+                wrote += 1
+            elif (
+                fcurve.data_path == "rotation_quaternion"
+                and 0 <= fcurve.array_index < 4
+            ):
+                fill(fcurve, [s[2][fcurve.array_index] for s in samples])
+                wrote += 1
+
+    return wrote > 0
+
+
+def _action_container(action):
+    """取 Action 里 F-Curve 的容器（新版分层 Action 用 channelbag，旧版用 action.fcurves）。"""
+    try:
+        if hasattr(action, "layers") and len(action.layers) > 0:
+            strip = action.layers[0].strips[0]
+
+            for slot in action.slots:
+                try:
+                    cb = strip.channelbag(slot, ensure=True)
+
+                    if cb is not None:
+                        return cb
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return action
+
+
+def _assign_action(camera, action):
+    """把 action 挂到摄像机上（含新版槽位绑定）。"""
+    if camera is None or action is None:
+        return
+
+    anim = camera.animation_data or camera.animation_data_create()
+    anim.action = action
+
+    try:
+        if len(action.slots) > 0:
+            anim.action_slot = action.slots[0]
+    except Exception:
+        pass
+
+
+def _read_action_samples(action):
+    """从 Action 的曲线反推样本 [(frame, (x,y,z), (w,x,y,z))]。"""
+    if action is None:
+        return []
+
+    container = _action_container(action)
+    loc = {}
+    rot = {}
+
+    for fcurve in container.fcurves:
+        if fcurve.data_path == "location" and 0 <= fcurve.array_index < 3:
+            loc[fcurve.array_index] = {
+                round(kp.co[0]): kp.co[1] for kp in fcurve.keyframe_points
+            }
+        elif (
+            fcurve.data_path == "rotation_quaternion"
+            and 0 <= fcurve.array_index < 4
+        ):
+            rot[fcurve.array_index] = {
+                round(kp.co[0]): kp.co[1] for kp in fcurve.keyframe_points
+            }
+
+    if len(loc) < 3 or len(rot) < 4:
+        return []
+
+    frames = sorted(set(loc[0].keys()) | set(rot[0].keys()))
+    out = []
+
+    for f in frames:
+        try:
+            out.append(
+                (
+                    f,
+                    (loc[0][f], loc[1][f], loc[2][f]),
+                    (rot[0][f], rot[1][f], rot[2][f], rot[3][f]),
+                )
+            )
+        except KeyError:
+            continue
+
+    return out
+
+
+def _store_samples_prop(camera, samples):
+    """把原始样本存成摄像机上的自定义属性（关掉 Blender 后仍可再调平滑）。"""
+    flat = []
+
+    for frame, loc, quat in samples:
+        flat.extend(
+            (
+                float(frame),
+                loc[0], loc[1], loc[2],
+                quat[0], quat[1], quat[2], quat[3],
+            )
+        )
+
+    camera["blecaco_samples"] = flat
+
+
+def _load_samples_prop(camera):
+    """从自定义属性恢复原始样本。"""
+    if camera is None:
+        return []
+
+    flat = camera.get("blecaco_samples")
+
+    if not flat:
+        return []
+
+    step = 8
+    out = []
+
+    for i in range(0, len(flat) - step + 1, step):
+        out.append(
+            (
+                int(round(flat[i])),
+                (flat[i + 1], flat[i + 2], flat[i + 3]),
+                (flat[i + 4], flat[i + 5], flat[i + 6], flat[i + 7]),
+            )
+        )
+
+    return out
+
+
+def _apply_live_smoothing(scene, force=False):
+    """按 UI 的「平滑」滑块实时重算曲线（节流由 _watch_state 负责）。"""
+    global _samples, _take_raw_action, _take_tuned_action, _take_live_strength
+
+    if _recording or _take_camera is None:
+        return
+
+    props = getattr(scene, "blecaco", None)
+
+    if props is None:
+        return
+
+    try:
+        strength = float(getattr(props, "smooth", 0.0))
+    except Exception:
+        return
+
+    if not force and _take_live_strength is not None and abs(strength - _take_live_strength) < 0.005:
+        return
+
+    # 样本来源：内存 → Raw 曲线 → 自定义属性（关掉文件再打开也能调）
+    if not _samples:
+        _samples = _read_action_samples(_take_raw_action)
+        _take_raw_action = None if _samples else _take_raw_action
+
+    if not _samples:
+        _samples = _load_samples_prop(_take_camera)
+
+    if not _samples:
+        return
+
+    # 平滑 = 0：直接用原始曲线
+    if strength < 0.005 and _take_raw_action is not None:
+        _assign_action(_take_camera, _take_raw_action)
+        _take_live_strength = strength
+        return
+
+    smoothed = _smooth_samples(_samples, strength)
+
+    if _take_tuned_action is None:
+        _take_tuned_action = _write_action(
+            _take_camera,
+            "Blecaco_%03d_Tuned" % _take_number,
+            smoothed,
+            linear=_SET_LINEAR_INTERPOLATION,
+        )
+    elif not _rewrite_action(
+        _take_tuned_action, smoothed, linear=_SET_LINEAR_INTERPOLATION
+    ):
+        return
+
+    if _take_tuned_action is None:
+        return
+
+    _assign_action(_take_camera, _take_tuned_action)
+    _take_live_strength = strength
+
+    print(
+        "[blecaco] 平滑已更新：strength=%.2f（%d 个样本，曲线 '%s'）"
+        % (strength, len(_samples), _take_tuned_action.name)
+    )
+
+
+def _finalize_motion():
+    """关闭/保存时：用最后的平滑值定格一条曲线，并丢弃其它数据。"""
+    global _take_raw_action, _take_tuned_action, _take_live_strength
+
+    camera = _take_camera
+
+    if camera is None:
+        return
+
+    # 样本可能只在 Raw 曲线/自定义属性里
+    samples = _samples or _read_action_samples(_take_raw_action)
+
+    if not samples:
+        samples = _load_samples_prop(camera)
+
+    if not samples:
+        return
+
+    scene = bpy.context.scene
+    props = getattr(scene, "blecaco", None) if scene is not None else None
+    strength = float(getattr(props, "smooth", 0.0)) if props is not None else 0.0
+
+    smoothed = _smooth_samples(samples, strength)
+
+    # 已经有一条 Blecaco_Motion（比如第二次保存）→ 原地重写，避免生成 .001 名字
+    existing = bpy.data.actions.get("Blecaco_Motion")
+    final = None
+
+    anim = camera.animation_data
+
+    if (
+        existing is not None
+        and anim is not None
+        and anim.action is existing
+        and _rewrite_action(existing, smoothed, linear=_SET_LINEAR_INTERPOLATION)
+    ):
+        final = existing
+
+    if final is None:
+        final = _write_action(
+            camera,
+            "Blecaco_Motion",
+            smoothed,
+            linear=_SET_LINEAR_INTERPOLATION,
+        )
+
+    if final is None:
+        return
+
+    # 丢弃其它 Blecaco 数据（Raw / Tuned / 旧 take）
+    dropped = 0
+
+    for action in list(bpy.data.actions):
+        if action.name.startswith("Blecaco_") and action is not final:
+            try:
+                bpy.data.actions.remove(action)
+                dropped += 1
+            except Exception:
+                pass
+
+    _assign_action(camera, final)
+
+    # 原始样本以自定义属性保留（默认隐藏），方便以后继续调平滑
+    _store_samples_prop(camera, samples)
+
+    _take_raw_action = None
+    _take_tuned_action = final
+    _take_live_strength = strength
+
+    print(
+        "[blecaco] 定格运动曲线：'%s'（平滑 %.2f，%d 帧），已丢弃其它 %d 条数据"
+        % (final.name, strength, len(samples), dropped)
+    )
+
+
+def _on_save_pre(*_args):
+    """保存 .blend 前定格曲线（Blender 没有可靠的"退出"钩子，用保存作为等价时机）。"""
+    try:
+        _finalize_motion()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+def _restore_from_camera_props():
+    """在场景里找"带 blecaco_samples 属性的相机"，恢复样本，使「平滑」滑块可继续调。
+
+    ⚠️ 不依赖 load_post：实测打开文件时 Blender 会重建 handler 列表，
+    所以这里做成"惰性恢复"—— 由 _watch_state 定期调用（也由 register/load_post 调）。
+    """
+    global _samples, _take_camera, _take_number, _take_raw_action
+    global _take_tuned_action, _take_live_strength
+
+    camera = None
+
+    for obj in bpy.data.objects:
+        if obj.type == 'CAMERA' and "blecaco_samples" in obj.keys():
+            camera = obj
+            break
+
+    _samples = []
+    _take_camera = camera
+    _take_number = 1
+    _take_raw_action = None
+    _take_tuned_action = (
+        camera.animation_data.action
+        if camera is not None and camera.animation_data else None
+    )
+    _take_live_strength = None
+
+    if camera is not None:
+        _samples = _load_samples_prop(camera)
+        print(
+            "[blecaco] 已恢复 %d 个录制样本（拖动「平滑」可继续调节）" % len(_samples)
+        )
+
+    return camera is not None
+
+
+def _on_load_post(*_args):
+    """打开文件后尝试恢复（若 Blender 没重建 handler 列表时有效）。"""
+    _restore_from_camera_props()
+
+
+def _maybe_restore():
+    """目标相机失效（换过文件/被删）或还没找到时，清状态并尝试恢复。
+
+    由 _watch_state 每秒最多调用一次。
+    """
+    global _samples, _take_camera, _take_raw_action
+    global _take_tuned_action, _take_live_strength
+
+    if _recording:
+        return
+
+    camera = _take_camera
+    alive = False
+
+    if camera is not None:
+        try:
+            camera.name      # 访问已释放的对象会抛 ReferenceError
+            alive = True
+        except ReferenceError:
+            alive = False
+
+    if alive and _samples:
+        return
+
+    # 相机没了（换文件/删除）→ 清掉属于旧文件的样本
+    if not alive:
+        _samples = []
+        _take_camera = None
+        _take_raw_action = None
+        _take_tuned_action = None
+        _take_live_strength = None
+
+    _restore_from_camera_props()
+
+def _write_recorded_actions(scene):
+    """停止录制：**只**写"原始数据"（平滑=0）一条曲线，然后按 UI 平滑值生成调好的那条。
+
+    对应用户要求：
+    1. 运动过程中只记录原始数据，不再预生成 0.25/0.75/1 等多个档位 ✓
+    2. 曲线的平滑程度由 UI 的「平滑」滑块动态决定 ✓
+    3. 关闭 Blender / 保存时用最后的平滑值定格一条曲线，其它数据丢弃（见 _finalize_motion）✓
+    """
+    global _take_camera, _take_number, _take_raw_action
+    global _take_tuned_action, _take_live_strength
+
+    if not _samples:
+        print("[blecaco] 本次录制没有采到样本，不生成曲线")
+        return
+
+    camera = scene.camera
+
+    if camera is None:
+        print("[blecaco] 停止录制时找不到活动摄像机，样本丢弃")
+        return
+
+    # take 编号
+    take = 1
+
+    for action in bpy.data.actions:
+        if action.name.startswith("Blecaco_"):
+            parts = action.name.split("_")
+
+            if len(parts) >= 2 and parts[1].isdigit():
+                take = max(take, int(parts[1]) + 1)
+
+    # 旧 Action 保命（加 fake user），避免被"换 Action"顺手清掉
+    anim = camera.animation_data
+
+    if anim is not None and anim.action is not None:
+        anim.action.use_fake_user = True
+
+    raw = _write_action(
+        camera,
+        "Blecaco_%03d_Raw" % take,
+        _samples,
+        linear=_SET_LINEAR_INTERPOLATION,
+    )
+
+    if raw is None:
+        return
+
+    _take_camera = camera
+    _take_number = take
+    _take_raw_action = raw
+    _take_tuned_action = None
+    _take_live_strength = None
+
+    _assign_action(camera, raw)
+
+    print(
+        "[blecaco] 录制完成：%d 个样本（每帧 1 个）→ 已写入原始曲线 '%s'"
+        % (len(_samples), raw.name)
+    )
+
+    # 立即按当前 UI 平滑值生成/挂上"调好的"曲线
+    _apply_live_smoothing(scene, force=True)
 
 def _convert_to_linear():
     """把活动摄像机的关键帧插值改成 LINEAR（由 _SET_LINEAR_INTERPOLATION 控制）。
@@ -709,6 +1361,7 @@ def _send_state(value):
 def handle_message(data):
     """处理手机发来的设置：record 开关 + 推流参数 + 活动摄像机。"""
     global _last_state, _last_frame
+    global _recording, _prev_auto_key
     global _record_frame_min, _record_frame_max
     global _last_stream_settings, _last_camera_state
 
@@ -775,8 +1428,14 @@ def handle_message(data):
         return
 
     try:
-        # Recording 按钮负责启停，不直接处理关键帧
-        scene.tool_settings.use_keyframe_insert_auto = value
+        # ★ 录制方式：录制中**只采样**（不写关键帧），停止时一次性写曲线。
+        #   强制关闭 Auto Keying —— 它是"记录选中物体"的全局机制，开着会把
+        #   活动摄像机以外的 object 也顺手录进去。关闭前记住用户原设置，停止时还原。
+        if value and not _recording:
+            _prev_auto_key = scene.tool_settings.use_keyframe_insert_auto
+
+        scene.tool_settings.use_keyframe_insert_auto = False
+        _recording = value
 
         if window.screen.is_animation_playing != value:
             with bpy.context.temp_override(
@@ -786,11 +1445,11 @@ def handle_message(data):
                 bpy.ops.screen.animation_play()
 
         if value:
-            # 关键帧的时间分辨率 = 场景的输出帧率，而不是上面那个 100Hz 的定时器。
-            # 24fps 去录 60Hz 的手持姿态，快速转动时会明显一跳一跳。
+            # 采样频率 = 项目帧率（每帧一个样本），不是定时器心跳频率
             _last_frame = None
+            _samples.clear()
 
-            # 重置本次录制的帧范围，停止时只平滑这一段
+            # 重置本次录制的帧范围
             _record_frame_min = None
             _record_frame_max = None
 
@@ -801,16 +1460,21 @@ def handle_message(data):
             )
 
             print(
-                f"[blecaco] 开始录制：输出帧率 {effective_fps:g} fps"
-                "（关键帧的时间分辨率就是它；手持快速转动建议提到 60）"
+                f"[blecaco] 开始录制：输出帧率 {effective_fps:g} fps，"
+                f"采样 1 帧 1 次（定时器心跳 {_record_interval():.4f}s）"
+            )
+            print(
+                "[blecaco] 记录内容：活动摄像机的 location(XYZ) + rotation_quaternion(WXYZ)；"
+                "Auto Keying 已临时关闭（不记录其它 object）"
             )
         else:
-            # 停止录制 → 对本次生成的曲线做后处理。
-            # 先平滑（改数值），再改插值类型（不改数值）。
-            _smooth_camera_curves(scene)
+            # 还原用户原本的 Auto Keying 设置
+            if _prev_auto_key is not None:
+                scene.tool_settings.use_keyframe_insert_auto = _prev_auto_key
+                _prev_auto_key = None
 
-            if _SET_LINEAR_INTERPOLATION:
-                _convert_to_linear()
+            # 停止录制 → 平滑 + 一次性批量写曲线（多档）
+            _write_recorded_actions(scene)
 
     except Exception:
         import traceback
@@ -826,10 +1490,37 @@ def _watch_state():
     #    于是所有「主动推送」集体静默失效（请求-响应因为不走这里，看起来还是正常的）。
     global _last_state, _last_clients, _last_output_fps
     global _last_stream_settings, _last_camera_state, _last_shading_state
+    global _restore_timer
 
     state = _get_state()
 
     scene = bpy.context.scene
+
+    # 拖动「平滑」滑块 → 实时重算上次录制的曲线（节流，避免每像素都重算）
+    global _live_smooth_timer
+
+    _live_smooth_timer += 0.1
+
+    if _live_smooth_timer >= _LIVE_SMOOTH_DEBOUNCE:
+        _live_smooth_timer = 0.0
+
+        if scene is not None:
+            _apply_live_smoothing(scene)
+
+    # 惰性恢复：还没找到"上次录制的相机"时，每秒扫一次
+    global _restore_timer
+
+    if _take_camera is None and not _samples:
+        _restore_timer += 0.1
+
+        if _restore_timer >= 1.0:
+            _restore_timer = 0.0
+
+            try:
+                _maybe_restore()
+            except Exception:
+                import traceback
+                traceback.print_exc()
     window = bpy.context.window
 
     auto_key = (
@@ -935,19 +1626,45 @@ def register():
             persistent=True,
         )
 
+    # 保存前定格曲线 / 打开文件后恢复样本
+    if _on_save_pre not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_on_save_pre)
+
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
+
     # 独立的摄像机关键帧记录器
     if not bpy.app.timers.is_registered(_record_camera_rotation):
         bpy.app.timers.register(
             _record_camera_rotation,
-            first_interval=_RECORD_INTERVAL,
+            first_interval=_record_interval(),
             persistent=True,
         )
+
+    # 尝试恢复上一次录制的样本（文件已打开的情况下）
+    try:
+        _restore_from_camera_props()
+    except Exception:
+        pass
 
     print("[blecaco] recording 状态监测已启动")
     print("[blecaco] 摄像机关键帧记录器已启动")
 
 
 def unregister():
+    # 插件被禁用/退出时也尽力定格一次
+    try:
+        _finalize_motion()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+    if _on_save_pre in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_on_save_pre)
+
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
+
     if bpy.app.timers.is_registered(_watch_state):
         bpy.app.timers.unregister(_watch_state)
 
