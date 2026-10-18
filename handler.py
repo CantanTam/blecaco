@@ -24,7 +24,7 @@ ACTION_MODULES = {
     "plane": "plane_action",
     "car": "car_action",
     "free": "free_action",
-    "drone":"drone",
+    "drone": "drone_action",
     "camera":"camera",
 }
 

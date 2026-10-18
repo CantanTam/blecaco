@@ -505,8 +505,19 @@ def _record_camera_rotation():
         if camera.rotation_mode != 'QUATERNION':
             camera.rotation_mode = 'QUATERNION'
 
-        p = camera.location
-        q = camera.rotation_quaternion
+        # ⚠️ 只有相机**有父级**时才改用世界坐标（Drone 模式把相机挂在 DRONE_EMPTY 下，
+        #    局部值会漏掉父级的运动）。
+        #    没有父级时保持原来的局部写法 —— 保证 free/plane/car/game 等其它 mode
+        #    的录制行为**完全不变** ✓
+        if camera.parent is None:
+            p = camera.location
+            q = camera.rotation_quaternion
+        else:
+            bpy.context.view_layer.update()
+
+            world = camera.matrix_world
+            p = world.translation
+            q = world.to_quaternion()
 
         _samples.append(
             (
@@ -593,6 +604,24 @@ def _smooth_samples(samples, strength):
         out.append((frame, loc, quat))
 
     return out
+
+
+def _unparent_keep_world(camera):
+    """解除相机的父级关系（保持世界变换不变）。
+
+    录制的是世界轨迹 → 必须让相机不再受父级影响，否则回放时会叠加父级变换。
+    """
+    if camera.parent is None:
+        return
+
+    bpy.context.view_layer.update()
+
+    world = camera.matrix_world.copy()
+    camera.parent = None
+    camera.matrix_world = world
+    bpy.context.view_layer.update()
+
+    print("[blecaco] 已解除相机父级（保持世界变换），曲线按世界坐标写入")
 
 
 def _write_action(camera, name, samples, linear=False):
@@ -932,6 +961,7 @@ def _finalize_motion():
     props = getattr(scene, "blecaco", None) if scene is not None else None
     strength = float(getattr(props, "smooth", 0.0)) if props is not None else 0.0
 
+    _unparent_keep_world(camera)
     smoothed = _smooth_samples(samples, strength)
 
     # 已经有一条 Blecaco_Motion（比如第二次保存）→ 原地重写，避免生成 .001 名字
@@ -1104,6 +1134,8 @@ def _write_recorded_actions(scene):
 
     if anim is not None and anim.action is not None:
         anim.action.use_fake_user = True
+
+    _unparent_keep_world(camera)
 
     raw = _write_action(
         camera,
