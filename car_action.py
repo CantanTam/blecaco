@@ -22,11 +22,29 @@ STEER_MODE: str = "rate"
 #   60°/s → 打满舵约 3 秒转 180°（掉头）
 #   90°/s → 2 秒掉头（更灵敏）
 STEER_YAW_RATE_DEG_PER_SEC: float = 60.0
+# 舵量力度曲线（>1 = 中心更细腻，转向更"稳"）
+#   1.6 → 半舵(22.5°)只有 0.33 力度，偏钝
+#   1.3 → 半舵 0.41，更接近直觉（推荐）
+STEER_EXPO: float = 1.3
+# 舵量平滑（秒）：抑制传感器抖动造成的转向毛刺
+STEER_SMOOTH_TAU: float = 0.06
+# 速度联动：车辆达到该速度（米/秒）时转向效率才满
+STEER_FULL_SPEED: float = 8.0
+# 速度联动开关
+STEER_SPEED_LINK: bool = True
+# 静止时的转向效率下限（0.0 = 停车完全不转向 ← 之前就是这个导致"打方向盘不动" ✗）
+#   0.4 = 停车时也能以 40% 效率转向（推荐，方便取景/测试）
+#   想完全模拟真车（停车不转）→ 设 0.0
+STEER_MIN_SPEED_FACTOR: float = 0.4
 STEER_AXIS: tuple = (0.0, 0.0, 1.0)
 STEER_SIGN: float = 1.0
 STEER_GAIN: float = 1.0
 STEER_MAX_DEG: float = 45.0
-STEER_DEADZONE_DEG: float = 1.5
+# 死区（度）：小于此角度完全不转向（抗手抖，防止画面缓慢自转）
+STEER_DEADZONE_DEG: float = 3.0
+# 迟滞系数：进入死区用 STEER_DEADZONE_DEG，退出用 DEADZONE × 此值
+#   （3.0° 进入 / 2.4° 退出 → 边缘不会来回抖）
+STEER_DEADZONE_EXIT_RATIO: float = 0.8
 # True：只响应方向盘（不再跟随手机偏航/俯仰）→ 符合"简化转向"
 STEER_IGNORE_PHONE_TILT: bool = True
 
@@ -35,6 +53,12 @@ _steer_angle: float = 0.0
 
 # 累计偏航角（弧度）：rate 模式下持续累加 → 支持掉头
 _car_yaw: float = 0.0
+
+# 平滑后的舵量（-1..1）
+_steer_lock: float = 0.0
+
+# 是否处于死区内（用于迟滞）
+_steer_in_deadzone: bool = True
 _last_message_time: float = 0.0
 
 # 调试：每秒打印一次转向角
@@ -72,7 +96,8 @@ def _move_forward(raw_distance: float) -> None:
 
 def handle_message(message):
     global _initial_camera_rotation, _steer_angle
-    global _car_yaw, _last_message_time
+    global _car_yaw, _last_message_time, _steer_lock
+    global _steer_in_deadzone
 
     data = message.get("data", {})
 
@@ -96,6 +121,8 @@ def handle_message(message):
         camera.rotation_mode = 'QUATERNION'
         _initial_camera_rotation = camera.rotation_quaternion.copy()
         _car_yaw = 0.0
+        _steer_lock = 0.0
+        _steer_in_deadzone = True
         _last_message_time = time.monotonic()
 
         print("[Blecaco][Car] Initial camera rotation captured")
@@ -142,8 +169,18 @@ def handle_message(message):
         math.asin(max(-1.0, min(1.0, x_axis.z)))
     )
 
-    if abs(angle_deg) < STEER_DEADZONE_DEG:
+    # 死区（带迟滞）：进入用 STEER_DEADZONE_DEG，退出用 × RATIO
+    deadzone_limit = (
+        STEER_DEADZONE_DEG
+        if _steer_in_deadzone
+        else STEER_DEADZONE_DEG * STEER_DEADZONE_EXIT_RATIO
+    )
+
+    if abs(angle_deg) <= deadzone_limit:
         angle_deg = 0.0
+        _steer_in_deadzone = True
+    else:
+        _steer_in_deadzone = False
 
     angle_deg = max(-STEER_MAX_DEG, min(STEER_MAX_DEG, angle_deg))
     angle_deg *= STEER_GAIN
@@ -155,6 +192,17 @@ def handle_message(message):
         steer_axis,
         STEER_SIGN * _steer_angle,
     )
+
+    # 前进量（转向的速度联动要用）
+    forward = float(data.get("forward", 0.0))
+
+    # 方向盘灵敏度倍率（手机端三档：0.6 / 1.0 / 1.6）
+    try:
+        steer_scale = float(data.get("steer_scale", 1.0))
+    except (TypeError, ValueError):
+        steer_scale = 1.0
+
+    steer_scale = max(0.0, min(5.0, steer_scale))
 
     if STEER_IGNORE_PHONE_TILT:
         base = _initial_camera_rotation
@@ -169,13 +217,39 @@ def handle_message(message):
 
     if STEER_MODE == "rate":
         # ── 角速度模式：方向盘角度 → 偏航角速度，持续累加 → 可掉头 ──
-        # 归一化的舵量：-1（左满舵）~ +1（右满舵）
-        lock = _steer_angle / math.radians(STEER_MAX_DEG)
-        lock = max(-1.0, min(1.0, lock))
+        # ① 归一化舵量（-1 左满舵 ~ +1 右满舵）
+        lock_raw = _steer_angle / math.radians(STEER_MAX_DEG)
+        lock_raw = max(-1.0, min(1.0, lock_raw))
+
+        # ② 力度曲线（保留符号）
+        lock_target = math.copysign(
+            abs(lock_raw) ** STEER_EXPO,
+            lock_raw,
+        ) if lock_raw != 0.0 else 0.0
+
+        # ③ 平滑（抑制抖动）：与帧率无关的指数逼近
+        k = 1.0 - math.exp(-dt / max(STEER_SMOOTH_TAU, 1e-4))
+
+        if abs(lock_target - _steer_lock) < 1e-5:
+            _steer_lock = lock_target
+        else:
+            _steer_lock += (lock_target - _steer_lock) * k
+
+        # ④ 速度联动：车速越快转向越有效；停车时不转向
+        if STEER_SPEED_LINK and dt > 1e-4:
+            speed_mps = abs(forward) / dt * CAR_MOVE_SPEED_MULTIPLIER
+            speed_factor = max(
+                STEER_MIN_SPEED_FACTOR,
+                min(1.0, speed_mps / max(STEER_FULL_SPEED, 1e-3)),
+            )
+        else:
+            speed_factor = 1.0
 
         _car_yaw += (
             math.radians(STEER_YAW_RATE_DEG_PER_SEC)
-            * lock
+            * _steer_lock
+            * speed_factor
+            * steer_scale
             * dt
         )
 
@@ -214,7 +288,5 @@ def handle_message(message):
     camera.rotation_quaternion = target
 
     # 处理同一条姿态消息中的前进量
-    forward = float(data.get("forward", 0.0))
-
     if forward != 0.0:
         _move_forward(forward)
