@@ -87,9 +87,17 @@ def handle_message(message):
         _initial_camera_rotation = camera.rotation_quaternion.copy()
 
     # 应用手机姿态
-    camera.rotation_quaternion = (
-        _initial_camera_rotation @ rotation
-    )
+    target = _initial_camera_rotation @ rotation
+
+    # ── 去掉横滚（roll）：只保留视线方向，让地平线始终水平 ──
+    # 相机的"视线" = 局部 -Z；用 to_track_quat('-Z', 'Y') 重建一个
+    # 没有横滚的姿态（Y 尽量朝向世界 +Z）→ 画面永远不会歪。
+    forward = target @ Vector((0.0, 0.0, -1.0))
+
+    if abs(forward.z) < 0.999:
+        target = forward.to_track_quat('-Z', 'Y')
+
+    camera.rotation_quaternion = target
 
     # 处理同一条姿态消息中的前进量
     forward = float(data.get("forward", 0.0))
