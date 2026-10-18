@@ -322,9 +322,17 @@ def handle_message(message):
     right_len = right_dir.length
 
     # ① 左杆左右 → 绕自身局部 Z 轴旋转（左推 = 左转）
+    # 旋转灵敏度倍率（手机端三档：0.35 / 1.0 / 1.6）
+    try:
+        yaw_sensitivity = float(data.get("yaw_scale", 1.0))
+    except (TypeError, ValueError):
+        yaw_sensitivity = 1.0
+
+    yaw_sensitivity = max(0.0, min(5.0, yaw_sensitivity))
+
     if lx != 0.0:
         yaw_scale = scale_l if SCALE_YAW_WITH_TIER else 1.0
-        yaw = RIG_YAW_RATE * dt * (-lx) * yaw_scale
+        yaw = RIG_YAW_RATE * dt * (-lx) * yaw_scale * yaw_sensitivity
         rotation = rotation @ Quaternion(
             (0.0, 0.0, 1.0),
             math.radians(yaw),
@@ -472,7 +480,8 @@ def _speed_target(value) -> float:
     except (TypeError, ValueError):
         return 1.0
 
-    return max(0.0, min(4.0, target))
+    # 允许 addon_set 的「移动倍数」放大（0.01~100），这里只做安全上限
+    return max(0.0, min(500.0, target))
 
 
 def _ramp_speed_scale(current: float, target: float, dt: float) -> float:
