@@ -4,6 +4,9 @@ from mathutils import Quaternion, Vector
 # Plane Mode 摄像机初始旋转
 _initial_camera_rotation = None
 
+#: LinkButton 切到 unlink 时保存的相机旋转（relink 时当新基准）
+_saved_camera_rotation = None
+
 # Plane Mode 摄像机移动速度倍数
 PLANE_MOVE_SPEED_MULTIPLIER: float = 5.0
 
@@ -30,7 +33,7 @@ def _move_forward(raw_distance: float) -> None:
 
 
 def handle_message(message):
-    global _initial_camera_rotation
+    global _initial_camera_rotation, _saved_camera_rotation
 
     data = message.get("data", {})
 
@@ -41,6 +44,52 @@ def handle_message(message):
     # 兼容单独发送的 forward 消息（现在前进量已合并进姿态消息里）
     if data.get("command") == "forward":
         _move_forward(float(data.get("distance", 0.1)))
+        return
+
+    # 0.1 LinkButton 切到 unlink：记下相机当前旋转
+    if data.get("command") == "unlink":
+        camera = bpy.context.scene.camera
+
+        if camera is None:
+            print("[Blecaco][Plane] No active camera")
+            return
+
+        camera.rotation_mode = 'QUATERNION'
+        _saved_camera_rotation = camera.rotation_quaternion.copy()
+
+        print(
+            "[Blecaco][Plane] Unlink: saved camera rotation = "
+            f"X={_saved_camera_rotation.x:.4f}, "
+            f"Y={_saved_camera_rotation.y:.4f}, "
+            f"Z={_saved_camera_rotation.z:.4f}, "
+            f"W={_saved_camera_rotation.w:.4f}"
+        )
+        return
+
+    # 0.2 LinkButton 切回 link：用保存的相机旋转当新的初始基准
+    if data.get("command") == "relink":
+        camera = bpy.context.scene.camera
+
+        if camera is None:
+            print("[Blecaco][Plane] No active camera")
+            return
+
+        camera.rotation_mode = 'QUATERNION'
+
+        if _saved_camera_rotation is None:
+            _initial_camera_rotation = camera.rotation_quaternion.copy()
+            print(
+                "[Blecaco][Plane] Relink: no saved rotation, "
+                "using current camera rotation as baseline"
+            )
+            return
+
+        _initial_camera_rotation = _saved_camera_rotation.copy()
+        camera.rotation_quaternion = _initial_camera_rotation.copy()
+
+        print(
+            "[Blecaco][Plane] Relink: camera rotation restored to saved baseline"
+        )
         return
 
     # 1. 初始化：记录摄像机初始旋转
