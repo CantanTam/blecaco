@@ -361,6 +361,99 @@ def _toggle_xray():
     return toggled > 0
 
 
+# ============================================================
+# 预览设置页的播放控制（手机 preview_set_page.tscn 的按钮）
+#
+# 手机发来 {"type":"setting", "name":"preview", "value":"play"} 之类，
+# 这里映射到 bpy.ops.screen.*
+# ============================================================
+_PREVIEW_OPS = {
+    "home": ("frame_jump", {"end": False}),
+    "prev": ("keyframe_jump", {"next": False}),
+    "reverse": ("animation_play", {"reverse": True}),
+    "play": ("animation_play", {}),
+    "next": ("keyframe_jump", {"next": True}),
+    "end": ("frame_jump", {"end": True}),
+    "pause": ("animation_pause", {}),
+}
+
+
+def _preview_context_override():
+    """构造 screen 操作需要的上下文覆盖（window / screen / area / region）。"""
+    window_manager = bpy.context.window_manager
+    window = bpy.context.window
+
+    if window is None and window_manager.windows:
+        window = window_manager.windows[0]
+
+    if window is None:
+        return None
+
+    screen = window.screen
+    area = None
+
+    for candidate in screen.areas:
+        if candidate.type in {"DOPESHEET_EDITOR", "TIMELINE", "VIEW_3D"}:
+            area = candidate
+            break
+
+    region = None
+
+    if area is not None and area.regions:
+        region = area.regions[0]
+
+    return window, screen, area, region
+
+
+def _apply_preview_action(value) -> bool:
+    """执行预览页按钮对应的 Blender 屏幕操作。"""
+    if not isinstance(value, str):
+        return False
+
+    key = value.strip().lower()
+    entry = _PREVIEW_OPS.get(key)
+
+    if entry is None:
+        print(f"[blecaco] 不认识的预览操作：{value!r}")
+        return False
+
+    op_name, kwargs = entry
+
+    try:
+        op = getattr(bpy.ops.screen, op_name)
+    except AttributeError:
+        print(f"[blecaco] Blender 没有 screen.{op_name}")
+        return False
+
+    override = _preview_context_override()
+
+    try:
+        if override is None:
+            op(**kwargs)
+        else:
+            window, screen, area, region = override
+            context = {
+                "window": window,
+                "screen": screen,
+            }
+
+            if area is not None:
+                context["area"] = area
+
+            if region is not None:
+                context["region"] = region
+
+            with bpy.context.temp_override(**context):
+                op(**kwargs)
+
+    except Exception as exc:
+        print(f"[blecaco] 预览操作 {key} 执行失败：{exc}")
+        return False
+
+    print(f"[blecaco] 预览操作：screen.{op_name}{kwargs}")
+    return True
+
+
 def _apply_shading(value):
     """手机按了着色按钮 → 改 Blender 的 3D 视图。成功返回 True。"""
     if not isinstance(value, str):
@@ -1434,6 +1527,11 @@ def handle_message(data):
     #    手机那边不做乐观更新，按钮状态完全跟着 Blender 走，
     #    立刻回推才能保证「按下去之后按钮确实是这个状态」是确定的
     #    （例如没有 3D 视图、操作被取消时，手机也能马上回到真实状态）。
+    # 预览页的播放控制按钮（HomeFrame / PrevFrame / Reverse / Play / NextFrame / EndFrame / Pause）
+    if name == "preview":
+        _apply_preview_action(data.get("value"))
+        return
+
     if name == "shading":
         value = data.get("value")
 
