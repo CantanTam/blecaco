@@ -1575,6 +1575,19 @@ def handle_message(data):
                 bpy.ops.screen.animation_play()
 
         if value:
+            # ⚠️ 录制开始：先摘掉相机上残留的旧 Action
+            #    否则旧动画会继续驱动相机 → 和实时操作（摇杆/roll）打架
+            #    → 表现为明显卡顿 / 姿态回跳 ✗
+            camera = scene.camera
+
+            if camera is not None and camera.animation_data is not None:
+                if camera.animation_data.action is not None:
+                    print(
+                        "[blecaco] 录制开始：摘掉相机旧 Action（%s）"
+                        % camera.animation_data.action.name
+                    )
+                    camera.animation_data.action = None
+
             # 采样频率 = 项目帧率（每帧一个样本），不是定时器心跳频率
             _last_frame = None
             _samples.clear()

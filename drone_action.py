@@ -61,6 +61,14 @@ TILT_FORWARD_Z_LIMIT: float = math.sin(math.radians(TILT_MAX_ELEVATION_DEG))
 TILT_UP_IS_PITCH_UP: bool = True
 
 # "打平/朝下" 两个一次性动作的**平滑过渡**（指数缓出）
+# ── Roll（横滚）参数 ──
+# 最大滚转角：保证相机 X 轴不会垂直（|X.z| ≤ sin(70°) ≈ 0.94）
+ROLL_MAX_DEG: float = 70.0
+# 点按步进的平滑过渡时间常数（秒）
+ROLL_SNAP_TAU: float = 0.15
+ROLL_SNAP_INTERVAL: float = 0.016
+ROLL_SNAP_EPS_DEG: float = 0.05
+
 TILT_SNAP_TAU: float = 0.20          # 时间常数（秒），越小越快（0.10→0.20 = 慢一倍）
 TILT_SNAP_INTERVAL: float = 0.016    # 过渡定时器间隔（≈60Hz）
 TILT_SNAP_EPS_DEG: float = 0.2       # 剩余角度小于它就直接收尾
@@ -153,6 +161,11 @@ def handle_message(message):
     # 双指倾斜 / 归水平 / 朝下 三个旋转命令
     if command in ("tilt", "tilt_level", "tilt_down"):
         _handle_tilt(command, data)
+        return
+
+    # Roll 按钮：点按步进 / 连续 roll / 停止
+    if command in ("roll_step", "roll_hold", "roll_stop", "roll_reset"):
+        _handle_roll(command, data)
         return
 
     if command != "stick":
@@ -405,10 +418,13 @@ def _camera_y_elevation_deg(camera) -> float:
     return math.degrees(math.asin(value))
 
 
-def _rotate_about_local_x(camera, angle_deg: float) -> None:
+def _rotate_about_pitch_axis(camera, angle_deg: float) -> None:
+    """绕**俯仰轴**（相机 X 轴的水平投影）旋转，与 roll 无关。"""
+    axis = _pitch_axis_world(camera)
+
     camera.rotation_quaternion = (
-        camera.rotation_quaternion
-        @ Quaternion((1.0, 0.0, 0.0), math.radians(angle_deg))
+        Quaternion(axis, math.radians(angle_deg))
+        @ camera.rotation_quaternion
     )
 
 
@@ -501,7 +517,7 @@ def _handle_tilt(command: str, data) -> None:
         angle = _clamp_pitch_angle(camera, angle)
 
         if abs(angle) > 1e-6:
-            _rotate_about_local_x(camera, angle)
+            _rotate_about_pitch_axis(camera, angle)
 
         return
 
@@ -523,19 +539,28 @@ def _handle_tilt(command: str, data) -> None:
 _snap_kind = None
 _snap_last_time = 0.0
 
+# ── Roll 状态（点按/回正的平滑过渡）──
+_roll_snap_target = None
+_roll_snap_last_time: float = 0.0
+
 
 def _camera_frame_quaternion(camera):
     """摄像机父级的世界旋转（无父级时为单位四元数）。
 
     ⚠️ 相机的 rotation_quaternion 是**相对父级**的，所以做"世界方向"比较时
-    必须先乘上父级的世界旋转 —— 否则挂到父级空物体下之后全部算错。
+    必须先乘上父级的世界旋转。
+
+    ⚠️⚠️ 性能：`view_layer.update()` 是**全量 depsgraph 更新**，很贵。
+        相机没有父级时（drone 现在就是）根本不需要它 ——
+        以前无条件调用，roll 每帧调 3~5 次 → 明显卡顿 ✗
+        现在只在**有父级**时才更新 ✓
     """
+    if camera.parent is None:
+        return Quaternion()
+
     bpy.context.view_layer.update()
 
-    if camera.parent is not None:
-        return camera.parent.matrix_world.to_quaternion()
-
-    return Quaternion()
+    return camera.parent.matrix_world.to_quaternion()
 
 
 def _camera_forward(camera) -> Vector:
@@ -551,15 +576,42 @@ def _camera_x_axis_world(camera) -> Vector:
     return frame @ (camera.rotation_quaternion @ Vector((1.0, 0.0, 0.0)))
 
 
-def _world_forward_after(camera, angle_deg: float) -> Vector:
-    """绕自身局部 X 旋转 angle_deg 后，视线在世界空间的方向。"""
-    frame = _camera_frame_quaternion(camera)
-    local = camera.rotation_quaternion @ Quaternion(
-        (1.0, 0.0, 0.0),
-        math.radians(angle_deg),
-    )
+def _pitch_axis_world(camera) -> Vector:
+    """俯仰轴 `X``` `：水平面内的"相机右方"。
 
-    return frame @ (local @ Vector((0.0, 0.0, -1.0)))
+    ⚠️ 不能直接用"相机 X 轴的投影"：roll 之后 X 轴本身是倾斜的 ✗，
+       每转一次它的投影都会漂移 → 轴不稳定 → 俯仰会歪 ✗。
+    正确做法：由**机头方向**（视线在水平面的投影）求水平右轴：
+        heading = 水平投影(camera -Z)      ← roll 不影响它 ✓
+        axis    = heading × 世界 +Z        ← 永远水平、永远稳定 ✓
+    水平无 roll 时，它正好等于"相机 X 轴的投影" ✓（语义不变）
+    """
+    forward = _camera_forward(camera)
+    flat = Vector((forward.x, forward.y, 0.0))
+
+    if flat.length > 1e-5:
+        heading = flat.normalized()
+
+        return Vector((heading.y, -heading.x, 0.0)).normalized()
+
+    # 视线接近垂直（已被 ±89° 限制挡住，正常不会走到这里）
+    axis = _camera_x_axis_world(camera)
+    flat_axis = Vector((axis.x, axis.y, 0.0))
+
+    if flat_axis.length > 1e-5:
+        return flat_axis.normalized()
+
+    return Vector((1.0, 0.0, 0.0))
+
+
+def _world_forward_after(camera, angle_deg: float) -> Vector:
+    """绕**俯仰轴**旋转 angle_deg 后，视线在世界空间的方向。"""
+    frame = _camera_frame_quaternion(camera)
+    axis = _pitch_axis_world(camera)
+
+    rotated = Quaternion(axis, math.radians(angle_deg)) @ camera.rotation_quaternion
+
+    return frame @ (rotated @ Vector((0.0, 0.0, -1.0)))
 
 
 def _camera_forward_local(camera) -> Vector:
@@ -590,8 +642,8 @@ def _target_direction(camera, kind: str) -> Vector:
 
 
 def _local_x_angle_to(camera, target: Vector) -> float:
-    """绕相机自身 X 轴，把视线转到 target（世界方向）所需的带符号角度（度）。"""
-    x_axis = _camera_x_axis_world(camera)
+    """绕**俯仰轴**把视线转到 target（世界方向）所需的带符号角度（度）。"""
+    x_axis = _pitch_axis_world(camera)
     current = _camera_forward(camera)
 
     cur_p = current - x_axis * current.dot(x_axis)
@@ -659,7 +711,7 @@ def _snap_tick():
 
     if abs(remaining) <= TILT_SNAP_EPS_DEG:
         if abs(remaining) > 1e-6:
-            _rotate_about_local_x(camera, remaining)
+            _rotate_about_pitch_axis(camera, remaining)
 
         print("[Blecaco][Drone] 过渡完成（%s）" % _snap_kind)
         _snap_kind = None
@@ -667,6 +719,181 @@ def _snap_tick():
 
     # 指数缓出：每帧走 remaining 的一个比例 → 起步快、收尾慢
     step = remaining * (1.0 - math.exp(-dt / TILT_SNAP_TAU))
-    _rotate_about_local_x(camera, step)
+    _rotate_about_pitch_axis(camera, step)
 
     return TILT_SNAP_INTERVAL
+
+
+# ============================================================
+# Roll（横滚）：绕相机自身 Z 轴（视线轴），限制 ±ROLL_MAX_DEG
+# ============================================================
+
+def _handle_roll(command: str, data) -> None:
+    global _roll_snap_target
+
+    camera = _get_camera()
+
+    if camera is None:
+        return
+
+    if command == "roll_step":
+        # 目标 = 当前姿态绕自身 Z 转一个（已限幅的）角度
+        angle = _clamp_roll_angle(camera, float(data.get("angle", 0.0)))
+
+        if angle == 0.0:
+            return
+
+        target = (
+            camera.rotation_quaternion
+            @ Quaternion((0.0, 0.0, 1.0), math.radians(angle))
+        )
+
+        _start_roll_snap(camera, target)
+        return
+
+    if command == "roll_hold":
+        _apply_roll(camera, float(data.get("delta", 0.0)))
+        return
+
+    if command == "roll_reset":
+        # 左右同时按下 → 平滑回正
+        # 回正定义：camera.X 轴水平 ✓ 且 camera.+Y 与世界 +Z 在同一竖直平面内 ✓
+        # → 目标姿态 = 用 forward 重建的水平姿态（to_track_quat 的默认 up 就是世界 +Z）
+        forward = _camera_forward(camera)
+
+        if forward.length < 1e-6:
+            return
+
+        target = forward.normalized().to_track_quat('-Z', 'Y')
+        _start_roll_snap(camera, target)
+        return
+
+    # roll_stop：取消还没走完的点按过渡
+    _roll_snap_target = None
+
+
+def _camera_roll_deg(camera) -> float:
+    """相机相对"同朝向水平姿态"的滚转角（度，带符号）。
+
+    用**上方向向量**求夹角定号（比 rotation_difference 的 axis 稳：
+    后者在小角度时符号会抖 ✗，实测 ±0.5° 时正负乱跳）
+    """
+    forward = _camera_forward(camera)
+
+    if abs(forward.z) >= 0.999:
+        return 0.0
+
+    camera.rotation_mode = 'QUATERNION'
+    level = forward.to_track_quat('-Z', 'Y')
+
+    up_camera = camera.rotation_quaternion @ Vector((0.0, 1.0, 0.0))
+    up_level = level @ Vector((0.0, 1.0, 0.0))
+
+    # 都投影到 ⊥ forward 的平面
+    a = up_camera - forward * up_camera.dot(forward)
+    b = up_level - forward * up_level.dot(forward)
+
+    if a.length < 1e-6 or b.length < 1e-6:
+        return 0.0
+
+    a.normalize()
+    b.normalize()
+
+    angle = a.angle(b)
+
+    if a.cross(b).dot(forward) < 0.0:
+        angle = -angle
+
+    return math.degrees(angle)
+
+
+def _clamp_roll_angle(camera, angle_deg: float) -> float:
+    """把滚转角夹住，保证累计 roll 不超过 ±ROLL_MAX_DEG。"""
+    if angle_deg == 0.0:
+        return 0.0
+
+    current = _camera_roll_deg(camera)
+    target = current + angle_deg
+
+    if target > ROLL_MAX_DEG:
+        return ROLL_MAX_DEG - current
+
+    if target < -ROLL_MAX_DEG:
+        return -ROLL_MAX_DEG - current
+
+    return angle_deg
+
+
+def _apply_roll(camera, angle_deg: float) -> None:
+    """绕相机自身 Z 轴滚转（带 ±ROLL_MAX_DEG 限制）。"""
+    if camera is None:
+        return
+
+    angle = _clamp_roll_angle(camera, angle_deg)
+
+    if angle == 0.0:
+        return
+
+    camera.rotation_mode = 'QUATERNION'
+
+    # 约定：传入的角度 = _camera_roll_deg() 测得 roll 的变化量 ✓
+    camera.rotation_quaternion = (
+        camera.rotation_quaternion
+        @ Quaternion((0.0, 0.0, 1.0), math.radians(angle))
+    )
+
+
+def _start_roll_snap(camera, target_quat) -> None:
+    """启动带平滑过渡的滚转（目标姿态直接给定，slerp 逼近）。
+
+    ⚠️ 用目标四元数 + slerp，而不是"测 roll 角度再换符号"：
+       后者在俯仰较大时符号会翻（实测俯仰 -30° 时越转越歪 ✗）
+    """
+    global _roll_snap_target, _roll_snap_last_time
+
+    if camera is None or target_quat is None:
+        return
+
+    _roll_snap_target = target_quat.copy()
+    _roll_snap_last_time = time.monotonic()
+
+    if not bpy.app.timers.is_registered(_roll_snap_tick):
+        bpy.app.timers.register(
+            _roll_snap_tick,
+            first_interval=ROLL_SNAP_INTERVAL,
+            persistent=True,
+        )
+
+
+def _roll_snap_tick():
+    """点按/回正的平滑过渡：向目标姿态做指数 slerp，收尾时吸附。"""
+    global _roll_snap_target, _roll_snap_last_time
+
+    camera = _get_camera()
+
+    if camera is None or _roll_snap_target is None:
+        _roll_snap_target = None
+        return None
+
+    now = time.monotonic()
+    dt = now - _roll_snap_last_time
+    _roll_snap_last_time = now
+    dt = min(max(dt, 1e-4), 0.1)
+
+    camera.rotation_mode = 'QUATERNION'
+
+    current = camera.rotation_quaternion.copy()
+    target = _roll_snap_target
+
+    remaining = current.rotation_difference(target).angle
+    remaining_deg = math.degrees(remaining)
+
+    if remaining_deg <= ROLL_SNAP_EPS_DEG:
+        camera.rotation_quaternion = target.copy()
+        _roll_snap_target = None
+        return None
+
+    k = 1.0 - math.exp(-dt / max(ROLL_SNAP_TAU, 1e-4))
+    camera.rotation_quaternion = current.slerp(target, k)
+
+    return ROLL_SNAP_INTERVAL

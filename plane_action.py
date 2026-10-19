@@ -132,8 +132,12 @@ def handle_message(message):
             )
             return
 
-        _initial_camera_rotation = _saved_camera_rotation.copy()
-        camera.rotation_quaternion = _initial_camera_rotation.copy()
+        # ⚠️ 不要覆盖相机当前旋转 ✗
+        #    用户明确不需要"旋转位置自动校正"：
+        #    预览页里拖动时间轴/播放会把相机移到别处，若这里硬拉回
+        #    unlink 那一刻的姿态，就会看到"自动校正初始化"的跳变 ✗
+        #    只把**当前**姿态作为手机新基准（手机端 relink 时会重新校准 ✓）
+        _initial_camera_rotation = camera.rotation_quaternion.copy()
 
         print(
             "[Blecaco][Plane] Relink: camera rotation restored to saved baseline"
