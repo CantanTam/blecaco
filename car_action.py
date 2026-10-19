@@ -10,10 +10,11 @@ _initial_camera_rotation = None
 # ── 方向盘转向参数 ──
 # 转向角 θ = 手机（已转换为相机坐标）的 X 轴与水平面的夹角
 #
-# 旋转轴：**世界坐标系的 Z 轴**（世界上方）
-#   → 相机水平左/右转（yaw），地平线始终保持水平 ✓
-#   （前乘 = 在世界坐标系里转；若想改成绕相机自身轴，把 STEER_IN_WORLD 设 False）
-STEER_IN_WORLD: bool = True
+# 旋转轴：**相机自身 Y 轴**（相机的"上方向"）
+#   → 转向跟随相机自身的姿态：以后加"地面追踪"（相机随地形倾斜）时，
+#     转向轴也会跟着地形的法线走 ✓（绕世界 Z 会跟地形脱节 ✗）
+#   （后乘 = 在相机自身坐标系里转）
+STEER_IN_WORLD: bool = False
 # 转向模式：
 #   "rate"     = 角速度控制（打方向盘 → 持续旋转 → 可掉头）★推荐
 #   "absolute" = 角度控制（方向盘角度 = 相机偏转角，转到底就停）
@@ -36,7 +37,8 @@ STEER_SPEED_LINK: bool = True
 #   0.4 = 停车时也能以 40% 效率转向（推荐，方便取景/测试）
 #   想完全模拟真车（停车不转）→ 设 0.0
 STEER_MIN_SPEED_FACTOR: float = 0.4
-STEER_AXIS: tuple = (0.0, 0.0, 1.0)
+# 相机自身 Y 轴（上方向）——配合 STEER_IN_WORLD = False
+STEER_AXIS: tuple = (0.0, 1.0, 0.0)
 STEER_SIGN: float = 1.0
 STEER_GAIN: float = 1.0
 STEER_MAX_DEG: float = 45.0
@@ -279,10 +281,10 @@ def handle_message(message):
             )
 
     if STEER_IN_WORLD:
-        # 前乘 = 在世界坐标系里绕世界 Z 轴转 → 水平左右转（yaw）
+        # 前乘 = 在世界坐标系里绕世界轴转
         target = steer @ base
     else:
-        # 后乘 = 绕相机自身局部轴转
+        # 后乘 = 绕相机自身 Y 轴（上方向）转 → 跟随相机姿态 ✓
         target = base @ steer
 
     camera.rotation_quaternion = target

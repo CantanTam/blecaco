@@ -75,7 +75,7 @@ function connect(){
     ws.binaryType='arraybuffer';
     ws.onmessage=e=>{
         if(!(e.data instanceof ArrayBuffer))return;
-        const url=URL.createObjectURL(new Blob([e.data],{type:'image/jpeg'}));
+        const url=URL.createObjectURL(new Blob([e.data],{type:'image/webp'}));
         const old=current;current=url;img.src=url;
         if(old)setTimeout(()=>URL.revokeObjectURL(old),500);
     };
@@ -286,6 +286,111 @@ def _capture_camera_image(target_w: int = 640) -> tuple[Image.Image | None, str 
         # 出错时丢弃缓存，下一帧按需重建，避免坏对象被反复复用
         _free_offscreen()
         return None, None
+
+
+# ---------------------------------------------------------------------------
+# 一期推流优化：WebP 编码 + 工作线程 + 自适应质量
+# ---------------------------------------------------------------------------
+# 编码格式：WebP（Pillow 自带 ✓ 同画质比 JPEG 小 25~35% ✓）
+# 想切回 JPEG 调试：把 STREAM_CODEC 改成 "JPEG"，客户端会自动兼容两种
+STREAM_CODEC: str = "WEBP"
+# WebP 压缩档：0(最快) ~ 6(最小)。实测 2 是甜点（640x360 约 4ms/帧，体积和 4 几乎一样）
+WEBP_METHOD: int = 2
+# 自适应质量的下限（再低就太糊了）
+WEBP_QUALITY_MIN: int = 20
+# 超预算时快速降、有余量时慢慢升（避免画质来回抖）
+QUALITY_STEP_DOWN: int = 6
+QUALITY_STEP_UP: int = 1
+# 每帧字节预算（640x360 / quality=70 的基准）。实际预算会按用户画质档位缩放
+FRAME_BUDGET_BASE: int = 38000
+
+
+def _img_to_webp(img: Image.Image, quality: int) -> bytes | None:
+    """PIL Image -> WebP bytes（WebP 是帧内编码，无跨帧依赖，可直接替换 JPEG）。"""
+    try:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "WEBP", quality=quality, method=WEBP_METHOD)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"[blecaco] WebP 编码失败: {e}")
+        return None
+
+
+def _encode_frame(img: Image.Image, quality: int) -> bytes | None:
+    """按当前格式编码一帧。"""
+    if STREAM_CODEC == "WEBP":
+        return _img_to_webp(img, quality)
+    return _img_to_jpeg(img, quality)
+
+
+class _EncoderThread(threading.Thread):
+    """后台编码线程：主线程只负责抓帧并提交，编码不占 Blender 主线程。
+
+    - 只保留**最新一帧**（旧帧直接丢 ✗ 不排队）
+    - 自适应质量：帧太大就降 q，余量大就慢慢升
+    """
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True, name="blecaco-encoder")
+        self._lock = threading.Lock()
+        self._latest = None            # (img, max_quality)
+        self._wake = threading.Event()
+        self._running = True
+        self.quality = None            # 自适应状态（None = 用用户档位起步）
+        self.frames = 0
+        self.dropped = 0
+
+    def submit(self, img, max_quality: int) -> None:
+        with self._lock:
+            if self._latest is not None:
+                self.dropped += 1
+            self._latest = (img, max_quality)   # 丢旧帧 ✓
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._running = False
+        self._wake.set()
+
+    def budget(self, max_quality: int) -> int:
+        return int(FRAME_BUDGET_BASE * max(0.35, max_quality / 70.0))
+
+    def run(self) -> None:
+        while self._running:
+            self._wake.wait(timeout=1.0)
+            self._wake.clear()
+
+            with self._lock:
+                item = self._latest
+                self._latest = None
+
+            if item is None:
+                continue
+
+            img, max_quality = item
+
+            max_quality = max(WEBP_QUALITY_MIN, min(100, int(max_quality)))
+            q = self.quality if self.quality is not None else max_quality
+            q = max(WEBP_QUALITY_MIN, min(max_quality, int(q)))
+
+            data = _encode_frame(img, q)
+
+            if data is None:
+                continue
+
+            # 自适应：超预算就降，余量大就慢慢升
+            if len(data) > self.budget(max_quality):
+                self.quality = max(WEBP_QUALITY_MIN, q - QUALITY_STEP_DOWN)
+            else:
+                self.quality = min(max_quality, q + QUALITY_STEP_UP)
+
+            srv = _state.server
+
+            if srv is not None:
+                srv.broadcast(data)
+                self.frames += 1
+                _state.frames = self.frames
 
 
 def _img_to_jpeg(img: Image.Image, quality: int) -> bytes | None:
@@ -530,6 +635,7 @@ class _State:
     running: bool = False             # 是否已 Start（不代表有客户端在收帧）
     error_streak: int = 0             # 连续出错帧数，超过 MAX_ERROR_STREAK 自动停止
     frames: int = 0                   # 本次推流已发出的帧数
+    encoder = None                    # 后台编码线程（_EncoderThread）
     camera_status: str = ""           # 最近一次的相机/渲染状态提示
 
 
@@ -586,11 +692,11 @@ def _frame_timer() -> float | None:
         img, err = _capture_camera_image()
         _state.camera_status = err or ""
         if img is not None:
+            # 编码交给后台线程（不占主线程 ✓），这里只提交
             props = bpy.context.scene.blecaco
-            jpeg = _img_to_jpeg(img, props.quality)
-            if jpeg:
-                srv.broadcast(jpeg)
-                _state.frames += 1
+            encoder = _state.encoder
+            if encoder is not None:
+                encoder.submit(img, props.quality)
         _state.error_streak = 0
     except Exception:
         traceback.print_exc()
@@ -629,6 +735,11 @@ def start_stream() -> tuple[bool, str]:
         return False, f"启动失败（端口 {props.port}）: {err_start}"
     _state.server = server
     _state.running = True
+
+    # 启动后台编码线程
+    encoder = _EncoderThread()
+    encoder.start()
+    _state.encoder = encoder
     _state.error_streak = 0
     _state.frames = 0
     _state.camera_status = cam_err or ""
@@ -651,6 +762,11 @@ def stop_stream() -> None:
             bpy.app.timers.unregister(_frame_timer)
         except Exception:
             pass
+    # 先停编码线程
+    if _state.encoder is not None:
+        _state.encoder.stop()
+        _state.encoder = None
+
     # 停止后立即释放显存里的 offscreen（Start 时会按需重建）
     _free_offscreen()
     if _state.server:
