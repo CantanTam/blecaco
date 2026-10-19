@@ -30,10 +30,10 @@ STICK_DEADZONE: float = 0.08
 # 指数：>1 时中心附近更细腻、边缘更灵敏（1.0 = 线性）
 STICK_EXPO: float = 1.6
 
-# ── 摇杆驱动 DRONE_EMPTY（无人机本体）的参数 ──
-# 左杆左右：绕 DRONE_EMPTY 自身局部 Z 轴旋转（度/秒）
+# ── 摇杆驱动摄像机本体的参数（不再使用空物体）──
+# 左杆左右：绕**世界 Z 轴**水平转向（度/秒）
 RIG_YAW_RATE: float = 90.0
-# 左杆上下：沿 DRONE_EMPTY 自身局部 Z 轴移动（米/秒）
+# 左杆上下：沿世界 Z 轴升降（米/秒）
 RIG_LIFT_SPEED: float = 2.0
 # 右杆左右：沿自身局部 X 轴移动（米/秒）
 RIG_STRAFE_SPEED: float = 2.0
@@ -54,7 +54,9 @@ SCALE_YAW_WITH_TIER: bool = False
 # ── 双指倾斜（TiltArea）：绕活动摄像机自身局部 X 轴旋转 ──
 TILT_RATE: float = 90.0          # 度/秒（满速）
 # 倾斜极限：视线不能越过"正上/正下"（|forward.z| 不能到 1，否则姿态退化）
-TILT_FORWARD_Z_LIMIT: float = 0.9995
+# 俯仰上限（度）：禁止视线完全垂直（89° → |forward.z| ≈ 0.99985）
+TILT_MAX_ELEVATION_DEG: float = 89.0
+TILT_FORWARD_Z_LIMIT: float = math.sin(math.radians(TILT_MAX_ELEVATION_DEG))
 # 上滑是抬头(True) 还是低头(False) —— 若手感反了改这里
 TILT_UP_IS_PITCH_UP: bool = True
 
@@ -89,129 +91,6 @@ def _shape(value) -> float:
 
 
 # 无人机支架空物体的名字
-DRONE_EMPTY_NAME: str = "DRONE_EMPTY"
-
-
-def _make_empty():
-    """创建 PLAIN_AXES 空物体并命名为 DRONE_EMPTY。
-
-    先用 bpy.ops.object.empty_add（与用户给的命令一致），
-    若当前上下文不允许操作（例如非 OBJECT 模式 / 没有活动视图层），
-    自动回退到数据 API（等价效果，不依赖上下文）。
-    """
-    # 方式一：操作器
-    try:
-        before = set(bpy.data.objects)
-        bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
-
-        created = bpy.context.object
-
-        if created is None or created.name not in bpy.data.objects:
-            created = next(
-                (obj for obj in bpy.data.objects if obj not in before),
-                None,
-            )
-
-        if created is not None:
-            created.name = DRONE_EMPTY_NAME
-            created.empty_display_type = 'PLAIN_AXES'
-            print("[Blecaco][Drone] DRONE_EMPTY 已创建（empty_add）")
-            return created
-    except Exception as exc:
-        print("[Blecaco][Drone] empty_add 失败，改用数据 API：", exc)
-
-    # 方式二：数据 API（不依赖上下文）
-    try:
-        empty = bpy.data.objects.new(DRONE_EMPTY_NAME, None)
-        empty.empty_display_type = 'PLAIN_AXES'
-        empty.location = (0.0, 0.0, 0.0)
-
-        scene = bpy.context.scene
-        collection = (
-            scene.collection
-            if scene is not None and scene.collection is not None
-            else bpy.context.view_layer.active_layer_collection.collection
-        )
-        collection.objects.link(empty)
-        print("[Blecaco][Drone] DRONE_EMPTY 已创建（数据 API）")
-        return empty
-    except Exception as exc:
-        print("[Blecaco][Drone] 数据 API 也失败：", exc)
-        return None
-
-
-def _enable_drone_rig() -> None:
-    """进入 Drone 控制：创建 DRONE_EMPTY 并把活动摄像机挂到它下面。
-
-    等价于用户给的三条命令：
-        empty_add(type='PLAIN_AXES', location=(0,0,0)); 命名为 DRONE_EMPTY
-        DRONE_EMPTY.location = scene.camera.location.copy()
-        cam.parent = empty; cam.matrix_parent_inverse = empty.matrix_world.inverted()
-
-    ⚠️ 没有活动摄像机时什么都不做。
-    ⚠️ 已有 DRONE_EMPTY 时直接复用（幂等，不会重复创建）。
-    """
-    scene = bpy.context.scene
-    camera = scene.camera if scene is not None else None
-
-    if camera is None:
-        print("[Blecaco][Drone] 没有活动摄像机，跳过创建 DRONE_EMPTY")
-        return
-
-    empty = bpy.data.objects.get(DRONE_EMPTY_NAME)
-
-    if empty is None:
-        empty = _make_empty()
-
-        if empty is None:
-            print("[Blecaco][Drone] 创建 DRONE_EMPTY 失败")
-            return
-
-    # 先取摄像机"世界"位置（camera.location 是相对父级的局部值，不能用）
-    bpy.context.view_layer.update()
-    world = camera.matrix_world.copy()
-
-    # 摄像机如果挂着旧父级，先解除（保持世界变换不变）
-    if camera.parent is not None:
-        camera.parent = None
-        camera.matrix_world = world
-        bpy.context.view_layer.update()
-        print("[Blecaco][Drone] 摄像机原有父级已解除（保持世界变换）")
-
-    # 空物体放到摄像机世界位置（清掉它自己可能残留的父级）
-    empty.parent = None
-    empty.matrix_world = Matrix.Translation(world.translation)
-
-    # 挂父级：显式构造逆矩阵（Translation 的逆 = 平移取负），
-    # 不读 empty.matrix_world —— 它可能还是刷新前的值（这正是之前"质心越飘越远"的原因）
-    camera.parent = empty
-    camera.matrix_parent_inverse = Matrix.Translation(-world.translation)
-
-    bpy.context.view_layer.update()
-
-    print(
-        "[Blecaco][Drone] 已创建并绑定 %s（摄像机=%s）"
-        % (DRONE_EMPTY_NAME, camera.name)
-    )
-
-
-def _disable_drone_rig() -> None:
-    """退出 Drone 控制：删除 DRONE_EMPTY（存在才删）。"""
-    empty = bpy.data.objects.get(DRONE_EMPTY_NAME)
-
-    if empty is None:
-        return
-
-    # 子级的世界变换保持不变（删除父级前后位置不跳）
-    bpy.context.view_layer.update()
-
-    for child in list(empty.children):
-        world = child.matrix_world.copy()
-        child.parent = None
-        child.matrix_world = world
-
-    bpy.data.objects.remove(empty, do_unlink=True)
-    print("[Blecaco][Drone] 已删除 %s" % DRONE_EMPTY_NAME)
 
 
 def _get_camera():
@@ -244,18 +123,19 @@ def handle_message(message):
         print("[Blecaco][Drone] 缺少 command 字段，已忽略：", data)
         return
 
-    # 进入 Drone 控制：创建 DRONE_EMPTY 并挂载活动摄像机
+    # 进入 Drone 控制：现在直接操作摄像机本体，不再创建空物体
     if command == "enable":
-        print("[Blecaco][Drone] 收到 enable")
+        camera = _get_camera()
 
-        _enable_drone_rig()
+        if camera is not None:
+            camera.rotation_mode = 'QUATERNION'
+
+        print("[Blecaco][Drone] 收到 enable（直接控制摄像机，无空物体）")
         return
 
-    # 退出 Drone 控制：删除 DRONE_EMPTY
+    # 退出 Drone 控制：没有空物体需要清理
     if command == "disable":
-        print("[Blecaco][Drone] 收到 disable")
-
-        _disable_drone_rig()
+        print("[Blecaco][Drone] 收到 disable（无空物体需要清理）")
         return
 
     # 进入 Drone Mode 时的初始化：只确保四元数模式
@@ -280,11 +160,13 @@ def handle_message(message):
 
     global _speed_scale_l, _speed_scale_r
 
-    rig = bpy.data.objects.get(DRONE_EMPTY_NAME)
+    camera = bpy.context.scene.camera
 
-    if rig is None:
-        _warn_missing_rig()
+    if camera is None:
+        print("[Blecaco][Drone] 没有活动摄像机")
         return
+
+    camera.rotation_mode = 'QUATERNION'
 
     dt = _clamp_dt(data)
 
@@ -298,7 +180,7 @@ def handle_message(message):
     rx = _shape(data.get("rx", 0.0))
     ry = _shape(data.get("ry", 0.0))
 
-    # 档位倍率（手机按摇杆距离分档发送）→ 平滑加减速逼近
+    # 档位倍率 → 平滑加减速逼近
     scale_l = _ramp_speed_scale(
         _speed_scale_l,
         _speed_target(data.get("speed_l", 1.0)),
@@ -313,16 +195,13 @@ def handle_message(message):
     _speed_scale_l = scale_l
     _speed_scale_r = scale_r
 
-    rotation = _rig_quaternion(rig)
-
     # 方向单位化：档位决定"总速度"，方向决定各轴分量的比例
     left_dir = Vector((lx, ly))
     left_len = left_dir.length
     right_dir = Vector((rx, ry))
     right_len = right_dir.length
 
-    # ① 左杆左右 → 绕自身局部 Z 轴旋转（左推 = 左转）
-    # 旋转灵敏度倍率（手机端三档：0.35 / 1.0 / 1.6）
+    # ① 左杆左右 → 绕**世界 Z 轴**水平转向（左推 = 左转）
     try:
         yaw_sensitivity = float(data.get("yaw_scale", 1.0))
     except (TypeError, ValueError):
@@ -333,33 +212,53 @@ def handle_message(message):
     if lx != 0.0:
         yaw_scale = scale_l if SCALE_YAW_WITH_TIER else 1.0
         yaw = RIG_YAW_RATE * dt * (-lx) * yaw_scale * yaw_sensitivity
-        rotation = rotation @ Quaternion(
-            (0.0, 0.0, 1.0),
-            math.radians(yaw),
+        camera.rotation_quaternion = (
+            Quaternion((0.0, 0.0, 1.0), math.radians(yaw))
+            @ camera.rotation_quaternion
         )
-        _set_rig_quaternion(rig, rotation)
 
-    # ② 左杆上下 → 沿自身局部 Z 轴上下移动（上推 = +Z）
-    # ③ 右杆左右 → 沿自身局部 X 轴（右推 = +X）
-    # ④ 右杆上下 → 沿自身局部 Y 轴（上推 = +Y，可用常量翻转）
-    # 左杆：档位决定总速度，方向按单位向量分配
+    # ② 左杆上下 → 沿世界 Z 轴升降
     lift_dir = (-ly / left_len) if left_len > 1e-5 else 0.0
     lift = RIG_LIFT_SPEED * dt * lift_dir * scale_l
 
-    # 右杆同理
+    # ③ 右杆左右 → 沿 X`（摄像机 X 轴在水平面的投影）
+    # ④ 右杆上下 → 沿 Y`（摄像机 -Z 轴在水平面的投影）
     strafe_dir = (rx / right_len) if right_len > 1e-5 else 0.0
-    long_dir = (
-        (-ry / right_len) if right_len > 1e-5 else 0.0
-    )
+    long_dir = (-ry / right_len) if right_len > 1e-5 else 0.0
+
     if not RIGHT_STICK_UP_POSITIVE_Y:
         long_dir = -long_dir
 
     strafe = RIG_STRAFE_SPEED * dt * strafe_dir * scale_r
     longitudinal = RIG_LONG_SPEED * dt * long_dir * scale_r
 
-    if lift != 0.0 or strafe != 0.0 or longitudinal != 0.0:
-        local_step = Vector((strafe, longitudinal, lift))
-        rig.location = rig.location + (rotation @ local_step)
+    # 计算水平投影轴
+    quat = camera.rotation_quaternion
+    camera_x = quat @ Vector((1.0, 0.0, 0.0))
+    camera_forward = quat @ Vector((0.0, 0.0, -1.0))
+
+    x_axis_flat = Vector((camera_x.x, camera_x.y, 0.0))
+    y_axis_flat = Vector((camera_forward.x, camera_forward.y, 0.0))
+
+    # 视线接近垂直时的兜底（正常有 ±89° 限制，几乎不会触发）
+    if x_axis_flat.length < 1e-5:
+        x_axis_flat = Vector((1.0, 0.0, 0.0))
+    else:
+        x_axis_flat.normalize()
+
+    if y_axis_flat.length < 1e-5:
+        y_axis_flat = Vector((0.0, 1.0, 0.0))
+    else:
+        y_axis_flat.normalize()
+
+    step_world = (
+        x_axis_flat * strafe
+        + y_axis_flat * longitudinal
+        + Vector((0.0, 0.0, lift))
+    )
+
+    if step_world.length > 0.0:
+        camera.location = camera.location + step_world
 
 
 # ============================================================
@@ -414,17 +313,16 @@ def _debug_accumulate(data, dt: float) -> None:
     if _dbg_time < 1.0:
         return
 
-    rig = bpy.data.objects.get(DRONE_EMPTY_NAME)
     camera = bpy.context.scene.camera if bpy.context.scene else None
 
-    if rig is not None:
-        euler = _rig_quaternion(rig).to_euler('XYZ')
-        rig_info = "rig loc=(%.2f,%.2f,%.2f) rotZ=%.1f°" % (
-            rig.location.x, rig.location.y, rig.location.z,
+    if camera is not None:
+        euler = camera.rotation_quaternion.to_euler('XYZ')
+        rig_info = "cam loc=(%.2f,%.2f,%.2f) rotZ=%.1f°" % (
+            camera.location.x, camera.location.y, camera.location.z,
             math.degrees(euler.z),
         )
     else:
-        rig_info = "rig=无"
+        rig_info = "cam=无"
 
     cam_info = "cam 仰角=%.1f°" % (
         _camera_y_elevation_deg(camera) if camera is not None else 0.0
@@ -451,26 +349,6 @@ def _debug_accumulate(data, dt: float) -> None:
     _dbg_tilt_sum = 0.0
     _dbg_level_count = 0
     _dbg_down_count = 0
-
-
-def _rig_quaternion(rig):
-    """读取 DRONE_EMPTY 当前姿态（统一成四元数）。
-
-    ⚠️ empty 默认是 Euler 旋转模式：直接写 rotation_quaternion 是**无效**的，
-    必须按 rotation_mode 分别处理。
-    """
-    if rig.rotation_mode == 'QUATERNION':
-        return rig.rotation_quaternion.copy()
-
-    return rig.rotation_euler.to_quaternion()
-
-
-def _set_rig_quaternion(rig, quat) -> None:
-    """按对象当前的旋转模式写回姿态。"""
-    if rig.rotation_mode == 'QUATERNION':
-        rig.rotation_quaternion = quat
-    else:
-        rig.rotation_euler = quat.to_euler(rig.rotation_mode)
 
 
 def _speed_target(value) -> float:
@@ -507,21 +385,6 @@ def _clamp_dt(data) -> float:
 
     return max(0.0, min(MAX_DELTA, dt))
 
-
-def _warn_missing_rig() -> None:
-    global _rig_warned
-
-    if not _rig_warned:
-        _rig_warned = True
-        print(
-            "[Blecaco][Drone] 没有 %s（请先打开 Drone 开关），摇杆数据已忽略"
-            % DRONE_EMPTY_NAME
-        )
-
-
-# ============================================================
-# 双指倾斜：绕活动摄像机自身局部 X 轴旋转
-# ============================================================
 
 def _camera_axes(camera):
     """返回摄像机自身坐标轴在世界空间的方向 (x, y, z)。"""
@@ -643,12 +506,12 @@ def _handle_tilt(command: str, data) -> None:
         return
 
     if command == "tilt_level":
-        # 一上一下 → 视线转到 DRONE_EMPTY 自身局部 +Y（"打平"方向）
+        # 一上一下 → 视线转到 摄像机自身局部 +Y（"打平"方向）
         _start_tilt_snap("vertical")
         return
 
     if command == "tilt_down":
-        # 一左一右 → 视线转到 DRONE_EMPTY 自身局部 -Z
+        # 一左一右 → 视线转到 摄像机自身局部 -Z
         _start_tilt_snap("horizontal")
         return
 
@@ -665,7 +528,7 @@ def _camera_frame_quaternion(camera):
     """摄像机父级的世界旋转（无父级时为单位四元数）。
 
     ⚠️ 相机的 rotation_quaternion 是**相对父级**的，所以做"世界方向"比较时
-    必须先乘上父级的世界旋转 —— 否则挂到 DRONE_EMPTY 下之后全部算错。
+    必须先乘上父级的世界旋转 —— 否则挂到父级空物体下之后全部算错。
     """
     bpy.context.view_layer.update()
 
@@ -708,22 +571,22 @@ def _camera_forward_local(camera) -> Vector:
 def _target_direction(camera, kind: str) -> Vector:
     """目标视线方向（世界坐标）。
 
-    "horizontal"（一左一右）：DRONE_EMPTY 自身局部 **-Z**
-    "vertical"  （一上一下）：DRONE_EMPTY 自身局部 **+Y**
-    （没有 DRONE_EMPTY 时退回世界坐标系的 -Z / +Y）
+    保持原来 DRONE_EMPTY 版本的**语义**（那个空物体只做偏航，从不俯仰/横滚）：
+      "horizontal"（一左一右）：世界 **-Z**（朝下看）
+      "vertical"  （一上一下）：摄像机当前的**水平朝向**（把视线打平）
     """
-    rig = bpy.data.objects.get(DRONE_EMPTY_NAME)
-
     if kind == "horizontal":
-        if rig is not None:
-            return -(rig.matrix_world.to_quaternion() @ Vector((0.0, 0.0, 1.0)))
-
         return Vector((0.0, 0.0, -1.0))
 
-    if rig is not None:
-        return rig.matrix_world.to_quaternion() @ Vector((0.0, 1.0, 0.0))
+    camera.rotation_mode = 'QUATERNION'
+    forward = camera.rotation_quaternion @ Vector((0.0, 0.0, -1.0))
+    flat = Vector((forward.x, forward.y, 0.0))
 
-    return Vector((0.0, 1.0, 0.0))
+    if flat.length > 1e-5:
+        return flat.normalized()
+
+    # 视线接近垂直时退回相机自身 +Y（此时"打平"没有唯一答案）
+    return (camera.rotation_quaternion @ Vector((0.0, 1.0, 0.0))).normalized()
 
 
 def _local_x_angle_to(camera, target: Vector) -> float:
