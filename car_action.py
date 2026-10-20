@@ -146,6 +146,16 @@ CAR_PLANE_MAX_SLOPE_DEG: float = 75.0
 # HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
 CAR_FLAT_PLANE_Z: float = 0.0
 
+# 目标位置（照搬 plane_action 的做法 ✓）
+# 和 camera.location 分开：目标可以跳，相机平滑跟过去 ✓
+_target_location: "Vector | None" = None
+
+# 上一次消息间隔（位置平滑要用）
+_last_dt: float = 0.0
+
+# 位置平滑时间常数（秒）——0 表示不平滑
+CAR_PATH_SMOOTH_TAU: float = 0.06
+
 # 上一次成功对齐时用的"水平朝向"（世界系水平单位向量）
 # 相机俯视接近垂直时，投影会退化 ✗ 用它兜底 → 不会 180° 掉头 ✓
 _last_heading: "Vector | None" = None
@@ -513,15 +523,29 @@ def _move_forward(raw_distance: float) -> None:
 
         forward.normalize()
 
-    new_location = camera.location + forward * distance
+    global _target_location, _last_dt
+
+    # 目标位置的起点：第一次用相机当前位置（照搬 plane 的做法 ✓）
+    if _target_location is None:
+        _target_location = camera.location.copy()
+
+    new_location = _target_location + forward * distance
 
     if CAR_GROUND_FOLLOW:
-        # 用移动距离粗略估计时间（速度恒定时距离正比于时间）
         speed = max(abs(CAR_MOVE_SPEED_MULTIPLIER), 1e-3)
         delta = abs(distance) / speed
+        _last_dt = delta
         new_location = _apply_ground_height(camera, new_location, delta)
 
-    camera.location = new_location
+    _target_location = new_location
+
+    # ── 轨迹防抖：相机位置平滑逼近目标位置 ✓（照搬 plane ✓）
+    #    这样即使目标位置有突变（首帧 / 拟合跳变），相机也是平滑过去的 ✓
+    if CAR_PATH_SMOOTH_TAU > 0.0 and _last_dt > 1e-5:
+        k = 1.0 - math.exp(-_last_dt / CAR_PATH_SMOOTH_TAU)
+        camera.location = camera.location.lerp(_target_location, k)
+    else:
+        camera.location = _target_location.copy()
 
 
 def handle_message(message):
@@ -583,6 +607,10 @@ def handle_message(message):
         _last_heading = None
         _ground_normal = None
         _ground_z = None
+
+        global _target_location, _last_dt
+        _target_location = camera.location.copy()   # ← 用当前相机位置做起点 ✓
+        _last_dt = 0.0
 
         print("[Blecaco][Car] Initial camera rotation captured（转向/地形状态已清零）")
         return
