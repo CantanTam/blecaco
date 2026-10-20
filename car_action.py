@@ -97,6 +97,20 @@ CAR_RAY_START_LIFT: float = 10.0
 # 探测失败（比如走出地面范围）时：True=保持当前高度，False=回退到初始高度
 CAR_KEEP_HEIGHT_ON_MISS: bool = True
 
+# ── 姿态贴合地形（相机局部 Y 轴 ⟂ 地面）──────────────────
+# 开启后：相机俯仰/横滚跟随地形法线，局部 Y 轴始终垂直地面
+#   → 上坡时相机自动抬头、横穿斜坡时自动横滚 ✓
+CAR_ALIGN_TO_GROUND: bool = True
+
+# 姿态贴合速度（秒）：越大越平滑但越迟钝；0 = 立即贴合
+CAR_ALIGN_SMOOTH_TAU: float = 0.15
+
+# 只在低于此坡度时才贴合（度）；超过则忽略（防止在悬崖峭壁上把相机翻转 ✗）
+CAR_ALIGN_MAX_SLOPE_DEG: float = 75.0
+
+# 调试：打印地形法线与相机实际 Y 轴的夹角
+CAR_ALIGN_DEBUG: bool = False
+
 # 调试：打印地面探测结果
 CAR_GROUND_DEBUG: bool = False
 
@@ -104,14 +118,17 @@ CAR_GROUND_DEBUG: bool = False
 _ground_z: float | None = None
 
 
-def _raycast_ground_height(origin: Vector) -> float | None:
-    """从 origin 往下打射线，返回命中点的高度；没打中返回 None。"""
+def _raycast_ground(origin: Vector):
+    """从 origin 往下打射线。
+
+    返回 (命中点高度, 地面法线) 或 (None, None)。
+    """
     scene = bpy.context.scene
 
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
     except Exception:
-        return None
+        return None, None
 
     ray_start = origin.copy()
     ray_start.z += CAR_RAY_START_LIFT
@@ -123,24 +140,97 @@ def _raycast_ground_height(origin: Vector) -> float | None:
         )
     except Exception as exc:                       # noqa: BLE001
         print(f"[Blecaco][Car] 地面探测异常：{exc}")
-        return None
+        return None, None
 
     if not hit:
         if CAR_GROUND_DEBUG:
             print("[Blecaco][Car] 地面探测未命中")
-        return None
+        return None, None
 
     if CAR_GROUND_DEBUG:
-        print(f"[Blecaco][Car] 地面命中 z={loc.z:.3f} 物体={obj.name if obj else '?'}")
+        print(
+            f"[Blecaco][Car] 地面命中 z={loc.z:.3f} "
+            f"法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f}) "
+            f"物体={obj.name if obj else '?'}"
+        )
 
-    return float(loc.z)
+    return float(loc.z), Vector(normal).normalized()
+
+
+def _raycast_ground_height(origin: Vector):
+    """只要高度（兼容旧调用）。"""
+    z, _normal = _raycast_ground(origin)
+    return z
+
+
+def _align_rotation_to_normal(camera, normal: Vector, delta: float) -> None:
+    """让相机局部 Y 轴垂直于地面（跟随地形俯仰/横滚），保留朝向。
+
+    做法：
+      1) 把当前朝向(-Z)投影到地面平面 → 得到新的前方向
+      2) 用 normal 作为上方向（局部 +Y）
+      3) 叉乘得到右方向（局部 +X），重新正交化
+      4) 构造旋转矩阵 → 转四元数
+    地形太陡（超过 CAR_ALIGN_MAX_SLOPE_DEG）时不做处理，避免相机翻过去 ✗
+    """
+    q = camera.rotation_quaternion
+
+    # 坡度太陡 → 不动
+    slope_deg = math.degrees(math.acos(max(-1.0, min(1.0, normal.z))))
+    if slope_deg > CAR_ALIGN_MAX_SLOPE_DEG:
+        return
+
+    # 当前前方（-Z）
+    forward = q @ Vector((0.0, 0.0, -1.0))
+
+    # 去掉法线分量，投影到地面平面
+    forward = forward - normal * forward.dot(normal)
+
+    if forward.length_squared < 1e-8:
+        # 正对着地面 → 用世界方向兜底
+        forward = Vector((0.0, 1.0, 0.0)) - normal * normal.y
+        if forward.length_squared < 1e-8:
+            return
+
+    forward.normalize()
+
+    # 右方向 = 前 × 上（Blender 右手系：X = Y × Z，Z = -forward）
+    right = forward.cross(normal)
+    if right.length_squared < 1e-8:
+        return
+    right.normalize()
+
+    # 重新正交化前方向，保证严格正交
+    forward = normal.cross(right).normalized()
+
+    # 构造目标旋转：局部 X=right, Y=normal, Z=-forward
+    from mathutils import Matrix
+    mat = Matrix((
+        (right.x, normal.x, -forward.x),
+        (right.y, normal.y, -forward.y),
+        (right.z, normal.z, -forward.z),
+    ))
+    target = mat.to_quaternion()
+
+    # 平滑：和帧率无关的指数逼近
+    if CAR_ALIGN_SMOOTH_TAU <= 0.0:
+        camera.rotation_quaternion = target
+    else:
+        alpha = 1.0 - math.exp(-max(delta, 0.0) / CAR_ALIGN_SMOOTH_TAU)
+        camera.rotation_quaternion = q.slerp(target, alpha)
+
+    if CAR_ALIGN_DEBUG:
+        now_y = camera.rotation_quaternion @ Vector((0.0, 1.0, 0.0))
+        ang = math.degrees(now_y.angle(normal))
+        print(f"[Blecaco][Car] 贴合地形：坡度={slope_deg:.1f}° Y轴与法线夹角={ang:.1f}°")
 
 
 def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
-    """把 new_location 的 z 调整到地面 + EYE_HEIGHT（带平滑）。"""
+    """把 new_location 的 z 调整到地面 + EYE_HEIGHT（带平滑），
+    并按需要让相机姿态贴合地形法线。"""
     global _ground_z
 
-    ground = _raycast_ground_height(new_location)
+    ground, normal = _raycast_ground(new_location)
 
     if ground is None:
         if CAR_KEEP_HEIGHT_ON_MISS:
@@ -157,6 +247,11 @@ def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
         _ground_z = _ground_z + (target_z - _ground_z) * alpha
 
     new_location.z = _ground_z
+
+    # 姿态贴合地形
+    if CAR_ALIGN_TO_GROUND and normal is not None:
+        _align_rotation_to_normal(camera, normal, delta)
+
     return new_location
 
 
