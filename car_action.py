@@ -142,6 +142,12 @@ CAR_RESAMPLE_MIN_MOVE_RATIO: float = 0.05
 # 拟合出的法线与竖直方向的夹角超过此值就不贴合（防悬崖翻车）
 CAR_PLANE_MAX_SLOPE_DEG: float = 75.0
 
+# 没有标记地面时是否强制相机贴"水平面"
+#   False（默认）→ 完全不干涉高度，相机自由移动 ✓
+#                   （之前是 True ✗ 会把相机拽到 EYE_HEIGHT，表现为"第一次前进沿 Z 轴跳一段"✗）
+#   True          → 用下面的 CAR_FLAT_PLANE_Z + 眼高当虚拟地面
+CAR_USE_FLAT_PLANE: bool = False
+
 # 没有标记地面时使用的水平面高度（世界 Z）
 # HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
 CAR_FLAT_PLANE_Z: float = 0.0
@@ -320,7 +326,16 @@ def _raycast_ground(origin: Vector):
         _ground_object = obj
 
     if obj is None:
-        # 没有标记物体 → 用水平面兜底（HAS_GROUND == false 的情况）
+        # 没有标记地面物体
+        if not CAR_USE_FLAT_PLANE:
+            # 默认：完全不干涉高度 ✓ 相机自由移动 ✓
+            # ⚠️ 之前返回 0 会把相机拽到 EYE_HEIGHT ✗
+            #    表现为"第一次前进沿世界 Z 轴跳一段" ✗
+            if CAR_GROUND_DEBUG:
+                print("[Blecaco][Car] 无地面标记，不干涉高度")
+            return None, None
+
+        # 可选：用固定水平面当虚拟地面
         if CAR_GROUND_DEBUG:
             print(f"[Blecaco][Car] 用水平面 z={CAR_FLAT_PLANE_Z}")
         return CAR_FLAT_PLANE_Z, Vector((0.0, 0.0, 1.0))
@@ -467,8 +482,10 @@ def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
     ground, normal = _raycast_ground(new_location)
 
     if ground is None:
-        if CAR_KEEP_HEIGHT_ON_MISS:
-            new_location.z = camera.location.z
+        # 探测不到地面 → 完全不改高度 ✓ 相机保持原样 ✓
+        if CAR_GROUND_DEBUG:
+            print("[Blecaco][Car] 无地面数据，保持当前高度")
+        new_location.z = camera.location.z
         return new_location
 
     target_z = ground + CAR_EYE_HEIGHT
