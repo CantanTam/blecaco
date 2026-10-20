@@ -152,6 +152,10 @@ CAR_USE_FLAT_PLANE: bool = False
 # HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
 CAR_FLAT_PLANE_Z: float = 0.0
 
+# 实测眼高：SetGround 时量出的"相机质心 → 地面命中点"距离 ✓
+# 之后所有高度跟踪都用它（不再用固定的 CAR_EYE_HEIGHT ✗）
+_measured_eye_height: "float | None" = None
+
 # 目标位置（照搬 plane_action 的做法 ✓）
 # 和 camera.location 分开：目标可以跳，相机平滑跟过去 ✓
 _target_location: "Vector | None" = None
@@ -174,6 +178,14 @@ _ground_normal: "Vector | None" = None
 _ground_object = None
 
 
+def _eye_height() -> float:
+    """当前生效的眼高：优先用实测值 ✓，没量过才退回 CAR_EYE_HEIGHT。"""
+    if _measured_eye_height is not None and _measured_eye_height > 1e-6:
+        return _measured_eye_height
+
+    return abs(CAR_EYE_HEIGHT)
+
+
 def _find_tagged_ground():
     """在场景里找带 is_ground 自定义属性的物体。"""
     for obj in bpy.data.objects:
@@ -186,7 +198,7 @@ def _find_tagged_ground():
 
 def _clear_ground_tag() -> None:
     """删掉所有物体的 is_ground 属性。"""
-    global _ground_object
+    global _ground_object, _measured_eye_height
 
     count = 0
     for obj in bpy.data.objects:
@@ -197,8 +209,9 @@ def _clear_ground_tag() -> None:
             except Exception as exc:              # noqa: BLE001
                 print(f"[Blecaco][Car] 删除 is_ground 失败（{obj.name}）：{exc}")
 
+    _measured_eye_height = None
     _ground_object = None
-    print(f"[Blecaco][Car] 已清除地面标记（{count} 个物体）")
+    print(f"[Blecaco][Car] 已清除地面标记（{count} 个物体）（实测眼高已清除）")
 
 
 def _notify_ground_status(has_ground: bool) -> None:
@@ -299,10 +312,16 @@ def _set_ground_by_ray() -> bool:
     obj["is_ground"] = True
     _ground_object = obj
 
+    # ★ 实测眼高：相机质心 → 命中点的距离 ✓
+    #   用户自己决定相机放多高，代码不猜 ✗
+    global _measured_eye_height
+    _measured_eye_height = (camera.location - loc).length
+
     print(
         f"[Blecaco][Car] 地面已标记：{obj.name} "
         f"（命中高度 z={loc.z:.2f} 法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f})）"
     )
+    print(f"[Blecaco][Car] 实测眼高 = {_measured_eye_height:.3f} 单位")
     return True
 
 
@@ -488,7 +507,7 @@ def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
         new_location.z = camera.location.z
         return new_location
 
-    target_z = ground + CAR_EYE_HEIGHT
+    target_z = ground + _eye_height()
 
     # 平滑：避免台阶/噪声导致高度突跳
     if CAR_HEIGHT_SMOOTH_TAU <= 0.0 or _ground_z is None:
@@ -820,7 +839,7 @@ def _raycast_object_z(obj, world_xy: Vector):
         inv = obj.matrix_world.inverted()
         world_origin = Vector((world_xy.x, world_xy.y, 0.0))
         # 起点抬到很高，保证能从上往下扫到
-        world_origin.z = CAR_EYE_HEIGHT * 100.0 + CAR_RAY_DISTANCE * 0.5
+        world_origin.z = _eye_height() * 100.0 + CAR_RAY_DISTANCE * 0.5
 
         local_origin = inv @ world_origin
         local_dir = (inv.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
@@ -941,7 +960,7 @@ def _sample_and_fit_plane(center_world: Vector):
 
     # 采样半径 = max(眼高 × 比例, 网格平均边长 × 倍数)
     #   → 既单位无关 ✓ 又保证跨过若干个三角面 ✓（否则拟合退化成单面法线 ✗）
-    radius = max(abs(CAR_EYE_HEIGHT) * CAR_SAMPLE_RADIUS_RATIO, 1e-6)
+    radius = max(_eye_height() * CAR_SAMPLE_RADIUS_RATIO, 1e-6)
 
     cell = _estimate_mesh_cell_size(obj)
 
@@ -949,7 +968,7 @@ def _sample_and_fit_plane(center_world: Vector):
         radius = max(radius, cell * CAR_SAMPLE_CELL_FACTOR)
 
     # 上限 = 眼高 × 此倍数（防止网格特别粗时半径失控 ✗）
-    radius = min(radius, abs(CAR_EYE_HEIGHT) * CAR_SAMPLE_RADIUS_MAX_RATIO)
+    radius = min(radius, _eye_height() * CAR_SAMPLE_RADIUS_MAX_RATIO)
 
     if CAR_GROUND_DEBUG:
         print(f"[Blecaco][Car] 网格边长≈{cell:.3f} 采样半径={radius:.3f}")
