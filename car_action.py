@@ -146,6 +146,10 @@ CAR_PLANE_MAX_SLOPE_DEG: float = 75.0
 # HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
 CAR_FLAT_PLANE_Z: float = 0.0
 
+# 当前拟合出的地面法线（None = 还没拟合出来）
+# 转向逻辑要把它并进目标姿态，否则每帧都会把地形对齐覆盖掉 ✗
+_ground_normal: "Vector | None" = None
+
 # 当前被标记为地面的物体（None = 还没标记）
 _ground_object = None
 
@@ -370,22 +374,23 @@ def _raycast_ground_height(origin: Vector):
     return z
 
 
-def _align_rotation_to_normal(camera, normal: Vector, delta: float) -> None:
-    """让相机局部 Y 轴垂直于地面（跟随地形俯仰/横滚），保留朝向。
+def _align_quaternion_to_normal(q, normal: Vector):
+    """返回「局部 Y 轴垂直于 normal」的对齐四元数（纯函数，不改物体）。
 
     做法：
       1) 把当前朝向(-Z)投影到地面平面 → 得到新的前方向
       2) 用 normal 作为上方向（局部 +Y）
       3) 叉乘得到右方向（局部 +X），重新正交化
       4) 构造旋转矩阵 → 转四元数
-    地形太陡（超过 CAR_ALIGN_MAX_SLOPE_DEG）时不做处理，避免相机翻过去 ✗
+    地形太陡（超过 CAR_ALIGN_MAX_SLOPE_DEG 或法线退化）时返回原四元数。
     """
-    q = camera.rotation_quaternion
+    if normal is None:
+        return q
 
-    # 坡度太陡 → 不动
     slope_deg = math.degrees(math.acos(max(-1.0, min(1.0, normal.z))))
+
     if slope_deg > CAR_ALIGN_MAX_SLOPE_DEG:
-        return
+        return q
 
     # 当前前方（-Z）
     forward = q @ Vector((0.0, 0.0, -1.0))
@@ -394,23 +399,19 @@ def _align_rotation_to_normal(camera, normal: Vector, delta: float) -> None:
     forward = forward - normal * forward.dot(normal)
 
     if forward.length_squared < 1e-8:
-        # 正对着地面 → 用世界方向兜底
         forward = Vector((0.0, 1.0, 0.0)) - normal * normal.y
         if forward.length_squared < 1e-8:
-            return
+            return q
 
     forward.normalize()
 
-    # 右方向 = 前 × 上（Blender 右手系：X = Y × Z，Z = -forward）
     right = forward.cross(normal)
     if right.length_squared < 1e-8:
-        return
+        return q
     right.normalize()
 
-    # 重新正交化前方向，保证严格正交
     forward = normal.cross(right).normalized()
 
-    # 构造目标旋转：局部 X=right, Y=normal, Z=-forward
     from mathutils import Matrix
     mat = Matrix((
         (right.x, normal.x, -forward.x),
@@ -419,17 +420,12 @@ def _align_rotation_to_normal(camera, normal: Vector, delta: float) -> None:
     ))
     target = mat.to_quaternion()
 
-    # 平滑：和帧率无关的指数逼近
-    if CAR_ALIGN_SMOOTH_TAU <= 0.0:
-        camera.rotation_quaternion = target
-    else:
-        alpha = 1.0 - math.exp(-max(delta, 0.0) / CAR_ALIGN_SMOOTH_TAU)
-        camera.rotation_quaternion = q.slerp(target, alpha)
-
     if CAR_ALIGN_DEBUG:
-        now_y = camera.rotation_quaternion @ Vector((0.0, 1.0, 0.0))
+        now_y = target @ Vector((0.0, 1.0, 0.0))
         ang = math.degrees(now_y.angle(normal))
-        print(f"[Blecaco][Car] 贴合地形：坡度={slope_deg:.1f}° Y轴与法线夹角={ang:.1f}°")
+        print(f"[Blecaco][Car] 贴合地形：坡度={slope_deg:.1f}° Y轴与法线夹角={ang:.2f}°")
+
+    return target
 
 
 def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
@@ -455,9 +451,11 @@ def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
 
     new_location.z = _ground_z
 
-    # 姿态贴合地形
+    # 记录拟合出的法线，交给转向逻辑并进目标姿态 ✓
+    # （原来这里是直接改 camera 旋转 ✗ 但会被 60~120Hz 的转向覆盖 ✗）
     if CAR_ALIGN_TO_GROUND and normal is not None:
-        _align_rotation_to_normal(camera, normal, delta)
+        global _ground_normal
+        _ground_normal = normal
 
     return new_location
 
@@ -716,6 +714,13 @@ def handle_message(message):
     else:
         # 后乘 = 绕相机自身 Y 轴（上方向）转 → 跟随相机姿态 ✓
         target = base @ steer
+
+    # ★ 关键：把地形贴合并进目标姿态
+    #   原来只在前进时对齐 ✗ 但转向每帧都把旋转重置成 base@steer ✗
+    #   → 地形倾斜被覆盖 ✗ 相机永远水平 ✗
+    #   所以在这里（转向之后）再对齐一次 ✓ 就没东西会覆盖它了 ✓
+    if CAR_ALIGN_TO_GROUND and _ground_normal is not None:
+        target = _align_quaternion_to_normal(target, _ground_normal)
 
     camera.rotation_quaternion = target
 
