@@ -1,3 +1,4 @@
+import json
 import math
 import time
 
@@ -118,6 +119,10 @@ CAR_GROUND_DEBUG: bool = False
 _ground_z: float | None = None
 
 
+# 没有标记地面时使用的水平面高度（世界 Z）
+# HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
+CAR_FLAT_PLANE_Z: float = 0.0
+
 # 当前被标记为地面的物体（None = 还没标记）
 _ground_object = None
 
@@ -147,6 +152,27 @@ def _clear_ground_tag() -> None:
 
     _ground_object = None
     print(f"[Blecaco][Car] 已清除地面标记（{count} 个物体）")
+
+
+def _notify_ground_status(has_ground: bool) -> None:
+    """把地面标记状态推给手机。"""
+    from . import streamer as _streamer
+
+    server = getattr(_streamer._state, "server", None)
+
+    if server is None:
+        print("[Blecaco][Car] 无法推送 ground_status（没有服务器）")
+        return
+
+    try:
+        server.send_text(json.dumps({
+            "type": "ground_status",
+            "has_ground": bool(has_ground),
+            "object": _ground_object.name if _ground_object else "",
+            "plane_z": CAR_FLAT_PLANE_Z,
+        }))
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[Blecaco][Car] ground_status 发送失败：{exc}")
 
 
 def _set_ground_by_ray() -> bool:
@@ -207,9 +233,10 @@ def _raycast_ground(origin: Vector):
         _ground_object = obj
 
     if obj is None:
+        # 没有标记物体 → 用水平面兜底（HAS_GROUND == false 的情况）
         if CAR_GROUND_DEBUG:
-            print("[Blecaco][Car] 还没有标记地面物体")
-        return None, None
+            print(f"[Blecaco][Car] 用水平面 z={CAR_FLAT_PLANE_Z}")
+        return CAR_FLAT_PLANE_Z, Vector((0.0, 0.0, 1.0))
 
     if obj.name not in bpy.context.scene.objects:
         # 物体被删了 → 清空引用
@@ -416,10 +443,16 @@ def handle_message(message):
         enabled = bool(data.get("enabled", False))
 
         if enabled:
-            _set_ground_by_ray()
+            # 沿相机局部 -Y 打射线
+            #   命中物体 → 打标，HAS_GROUND = true
+            #   没命中   → 不打标，HAS_GROUND = false（用水平面兜底）
+            has_ground = _set_ground_by_ray()
         else:
             _clear_ground_tag()
+            has_ground = False
 
+        # 把最终结果回传手机（手机据此更新 HAS_GROUND 与图标）
+        _notify_ground_status(has_ground)
         return
 
     # 初始化：记录摄像机初始旋转
