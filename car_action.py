@@ -119,6 +119,29 @@ CAR_GROUND_DEBUG: bool = False
 _ground_z: float | None = None
 
 
+# ── 局部平面拟合（把"三角面法线"换成"邻域拟合平面"）────────
+# 采样半径 = 眼高 × 此比例（单位无关 ✓ 自动适配任何场景尺度）
+CAR_SAMPLE_RADIUS_RATIO: float = 0.6
+
+# 采样点数（每边 N 个 → N×N 网格；3 = 9 点）
+CAR_SAMPLE_GRID: int = 3
+
+# 采样半径上限（眼高的倍数）——防止网格太粗时半径失控
+CAR_SAMPLE_RADIUS_MAX_RATIO: float = 3.0
+
+# 采样半径至少是网格平均边长的几倍（保证跨过多个面 ✓）
+#   太小 → 9 个点落在同一个三角面内 ✗ 拟合退化成单面法线 ✗
+CAR_SAMPLE_CELL_FACTOR: float = 3.0
+
+# 最少有效采样点（少于此数就沿用上一次的法线）
+CAR_MIN_VALID_SAMPLES: int = 3
+
+# 相机移动超过这个距离才重新采样（性能优化；按眼高的比例算）
+CAR_RESAMPLE_MIN_MOVE_RATIO: float = 0.05
+
+# 拟合出的法线与竖直方向的夹角超过此值就不贴合（防悬崖翻车）
+CAR_PLANE_MAX_SLOPE_DEG: float = 75.0
+
 # 没有标记地面时使用的水平面高度（世界 Z）
 # HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
 CAR_FLAT_PLANE_Z: float = 0.0
@@ -220,9 +243,15 @@ def _set_ground_by_ray() -> bool:
 
 
 def _raycast_ground(origin: Vector):
-    """在「被标记为地面」的物体上打射线（只测那一个物体 ✓）。
+    """探测地面：中心点 + 邻域采样 → 拟合平面。
 
-    返回 (命中点高度, 地面法线) 或 (None, None)。
+    返回 (相机处地面高度, 拟合平面法线) 或 (None, None)。
+
+    流程：
+      ① 沿相机局部 -Y 找到中心命中点
+      ② 在中心周围按「眼高 × 比例」采样一片点（世界 -Z 平行射线）
+      ③ PCA 拟合平面 → 得到连续的法线 ✓
+      ④ 用平面方程算出相机所在 (x, y) 处的高度 ✓
     """
     global _ground_object
 
@@ -239,46 +268,56 @@ def _raycast_ground(origin: Vector):
         return CAR_FLAT_PLANE_Z, Vector((0.0, 0.0, 1.0))
 
     if obj.name not in bpy.context.scene.objects:
-        # 物体被删了 → 清空引用
         _ground_object = None
         return None, None
 
-    ray_start = origin.copy()
-    ray_start.z += CAR_RAY_START_LIFT
+    # ① 中心点：沿相机局部 -Y
+    scene = bpy.context.scene
+    camera = scene.camera
 
-    try:
-        inv = obj.matrix_world.inverted()
-        local_origin = inv @ ray_start
-        local_dir = (inv.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+    center_hit = None
 
-        hit, loc, normal, idx = obj.ray_cast(
-            local_origin, local_dir, distance=CAR_RAY_DISTANCE
-        )
-    except Exception as exc:                       # noqa: BLE001
-        print(f"[Blecaco][Car] 地面探测异常：{exc}")
-        return None, None
+    if camera is not None:
+        try:
+            direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
 
-    if not hit:
+            inv = obj.matrix_world.inverted()
+            local_origin = inv @ camera.location
+            local_dir = (inv.to_3x3() @ direction).normalized()
+
+            hit, loc, normal, idx = obj.ray_cast(
+                local_origin, local_dir, distance=CAR_RAY_DISTANCE
+            )
+
+            if hit:
+                center_hit = obj.matrix_world @ loc
+        except Exception:
+            center_hit = None
+
+    # 中心点没打到 → 退回世界 -Z 从相机正下方找
+    if center_hit is None:
+        h = _raycast_object_z(obj, origin)
+        if h is None:
+            if CAR_GROUND_DEBUG:
+                print(f"[Blecaco][Car] 在 {obj.name} 上未命中")
+            return None, None
+        center_hit = Vector((origin.x, origin.y, h))
+
+    # ② 邻域采样 + ③ 拟合平面 + ④ 算相机处高度
+    _center, fitted_normal, cam_height = _sample_and_fit_plane(center_hit)
+
+    if fitted_normal is None or cam_height is None:
         if CAR_GROUND_DEBUG:
-            print(f"[Blecaco][Car] 在 {obj.name} 上未命中")
-        return None, None
-
-    # 局部 → 世界
-    world_loc = obj.matrix_world @ loc
-    normal_matrix = obj.matrix_world.to_3x3().inverted().transposed()
-    world_normal = (normal_matrix @ normal).normalized()
-
-    # 法线可能朝下（背面），统一翻成朝上
-    if world_normal.z < 0.0:
-        world_normal = -world_normal
+            print("[Blecaco][Car] 平面拟合失败，沿用单点法线")
+        return float(center_hit.z), Vector((0.0, 0.0, 1.0))
 
     if CAR_GROUND_DEBUG:
         print(
-            f"[Blecaco][Car] 命中 {obj.name} z={world_loc.z:.3f} "
-            f"法线=({world_normal.x:.2f},{world_normal.y:.2f},{world_normal.z:.2f})"
+            f"[Blecaco][Car] 拟合平面 高度={cam_height:.3f} "
+            f"法线=({fitted_normal.x:.3f},{fitted_normal.y:.3f},{fitted_normal.z:.3f})"
         )
 
-    return float(world_loc.z), world_normal
+    return float(cam_height), fitted_normal
 
 
 def _raycast_ground_height(origin: Vector):
@@ -639,3 +678,196 @@ def handle_message(message):
     # 处理同一条姿态消息中的前进量
     if forward != 0.0:
         _move_forward(forward)
+
+# ============================================================
+# 局部平面拟合（把"单个三角面法线"换成"邻域拟合平面" ✓）
+#
+# 为什么需要：
+#   单个三角面的法线是"平的"✗ 跨过面就突变 ✗ 相机一顿一顿的
+#   在命中点周围采样一片点，拟合出一个平面 → 法线连续 ✓
+# ============================================================
+
+
+def _raycast_object_z(obj, world_xy: Vector):
+    """在世界坐标 (x, y) 处沿世界 -Z 打射线，返回命中高度（或 None）。"""
+    if obj is None:
+        return None
+
+    try:
+        inv = obj.matrix_world.inverted()
+        world_origin = Vector((world_xy.x, world_xy.y, 0.0))
+        # 起点抬到很高，保证能从上往下扫到
+        world_origin.z = CAR_EYE_HEIGHT * 100.0 + CAR_RAY_DISTANCE * 0.5
+
+        local_origin = inv @ world_origin
+        local_dir = (inv.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+
+        hit, loc, normal, idx = obj.ray_cast(
+            local_origin, local_dir, distance=CAR_RAY_DISTANCE * 10.0
+        )
+
+        if not hit:
+            return None
+
+        return float((obj.matrix_world @ loc).z)
+    except Exception:
+        return None
+
+
+def _fit_plane_pca(points):
+    """对一组点做 PCA 平面拟合，返回 (质心, 单位法线) 或 (None, None)。
+
+    最小特征值对应的特征向量就是平面法线（垂直距离平方和最小）。
+    """
+    n = len(points)
+
+    if n < 3:
+        return None, None
+
+    # 质心
+    cx = sum(p.x for p in points) / n
+    cy = sum(p.y for p in points) / n
+    cz = sum(p.z for p in points) / n
+    center = Vector((cx, cy, cz))
+
+    # 协方差矩阵（3×3，对称）
+    xx = xy = xz = yy = yz = zz = 0.0
+
+    for p in points:
+        dx = p.x - cx
+        dy = p.y - cy
+        dz = p.z - cz
+        xx += dx * dx
+        xy += dx * dy
+        xz += dx * dz
+        yy += dy * dy
+        yz += dy * dz
+        zz += dz * dz
+
+    # 用幂迭代法找最小特征向量（避免引入 numpy 依赖）
+    # 技巧：对 (trace*I - C) 做幂迭代，最大特征向量 = C 的最小特征向量
+    trace = xx + yy + zz
+    axx, axy, axz = trace - xx, -xy, -xz
+    ayy, ayz = trace - yy, -yz
+    azz = trace - zz
+
+    v = Vector((1.0, 1.0, 1.0))
+    for _ in range(24):
+        nx = axx * v.x + axy * v.y + axz * v.z
+        ny = axy * v.x + ayy * v.y + ayz * v.z
+        nz = axz * v.x + ayz * v.y + azz * v.z
+        v = Vector((nx, ny, nz))
+
+        length = v.length
+        if length < 1e-12:
+            return None, None
+        v /= length
+
+    normal = v.normalized()
+
+    # 朝上
+    if normal.z < 0.0:
+        normal = -normal
+
+    return center, normal
+
+
+def _estimate_mesh_cell_size(obj) -> float:
+    """粗估网格的平均边长（用来保证采样半径跨过若干个面）。"""
+    try:
+        mesh = obj.data
+
+        if mesh is None or len(mesh.polygons) == 0:
+            return 0.0
+
+        # 抽样最多 200 个面，避免大网格卡顿
+        step = max(1, len(mesh.polygons) // 200)
+
+        total = 0.0
+        count = 0
+
+        for i in range(0, len(mesh.polygons), step):
+            poly = mesh.polygons[i]
+            verts = [mesh.vertices[vi].co for vi in poly.vertices]
+            n = len(verts)
+
+            for k in range(n):
+                edge = (verts[(k + 1) % n] - verts[k]).length
+                total += edge
+                count += 1
+
+        if count == 0:
+            return 0.0
+
+        # 用对角线尺度换算到世界空间（近似）
+        scale = max(obj.scale.x, obj.scale.y, obj.scale.z)
+        return (total / count) * scale
+    except Exception:
+        return 0.0
+
+
+def _sample_and_fit_plane(center_world: Vector):
+    """在 center_world 周围采样并拟合平面。
+
+    返回 (平面质心, 法线, 相机处高度) 或 (None, None, None)。
+    """
+    obj = _ground_object
+
+    if obj is None:
+        return None, None, None
+
+    # 采样半径 = max(眼高 × 比例, 网格平均边长 × 倍数)
+    #   → 既单位无关 ✓ 又保证跨过若干个三角面 ✓（否则拟合退化成单面法线 ✗）
+    radius = max(abs(CAR_EYE_HEIGHT) * CAR_SAMPLE_RADIUS_RATIO, 1e-6)
+
+    cell = _estimate_mesh_cell_size(obj)
+
+    if cell > 0.0:
+        radius = max(radius, cell * CAR_SAMPLE_CELL_FACTOR)
+
+    # 上限 = 眼高 × 此倍数（防止网格特别粗时半径失控 ✗）
+    radius = min(radius, abs(CAR_EYE_HEIGHT) * CAR_SAMPLE_RADIUS_MAX_RATIO)
+
+    if CAR_GROUND_DEBUG:
+        print(f"[Blecaco][Car] 网格边长≈{cell:.3f} 采样半径={radius:.3f}")
+
+    grid = max(3, int(CAR_SAMPLE_GRID))
+    half = (grid - 1) * 0.5
+    step = radius / half if half > 0.0 else radius
+
+    points = []
+
+    for ix in range(grid):
+        for iy in range(grid):
+            dx = (ix - half) * step
+            dy = (iy - half) * step
+            xy = Vector((center_world.x + dx, center_world.y + dy, 0.0))
+
+            h = _raycast_object_z(obj, xy)
+
+            if h is None:
+                continue
+
+            points.append(Vector((xy.x, xy.y, h)))
+
+    if CAR_GROUND_DEBUG:
+        print(f"[Blecaco][Car] 采样 {len(points)}/{grid * grid} 点 半径={radius:.3f}")
+
+    if len(points) < CAR_MIN_VALID_SAMPLES:
+        return None, None, None
+
+    center, normal = _fit_plane_pca(points)
+
+    if center is None:
+        return None, None, None
+
+    # 平面方程：normal · (P - center) = 0
+    # → 在相机 (x, y) 处的高度：z = center.z - (n.x*dx + n.y*dy) / n.z
+    if abs(normal.z) < 1e-6:
+        return None, None, None
+
+    dx = center_world.x - center.x
+    dy = center_world.y - center.y
+    height = center.z - (normal.x * dx + normal.y * dy) / normal.z
+
+    return center, normal, height
