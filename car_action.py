@@ -187,12 +187,36 @@ def _notify_ground_status(has_ground: bool) -> None:
         print("[Blecaco][Car] 无法推送 ground_status（没有服务器）")
         return
 
+    # 附带诊断信息（手机日志里能直接看到，不用看 Blender 终端 ✓）
+    diag = {}
+
+    try:
+        obj = _ground_object
+
+        if obj is not None:
+            diag["cell"] = round(_estimate_mesh_cell_size(obj), 3)
+            diag["dims"] = [round(v, 2) for v in obj.dimensions]
+
+            cam = bpy.context.scene.camera
+
+            if cam is not None:
+                diag["cam_z"] = round(cam.location.z, 3)
+
+                height, normal = _raycast_ground(cam.location)
+
+                if height is not None:
+                    diag["fit_z"] = round(height, 3)
+                    diag["normal"] = [round(v, 3) for v in normal]
+    except Exception as exc:                       # noqa: BLE001
+        diag["err"] = str(exc)
+
     try:
         server.send_text(json.dumps({
             "type": "ground_status",
             "has_ground": bool(has_ground),
             "object": _ground_object.name if _ground_object else "",
             "plane_z": CAR_FLAT_PLANE_Z,
+            "diag": diag,
         }))
     except Exception as exc:                       # noqa: BLE001
         print(f"[Blecaco][Car] ground_status 发送失败：{exc}")
@@ -218,11 +242,27 @@ def _set_ground_by_ray() -> bool:
     direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
     origin = camera.location.copy()
 
+    hit = False
+    loc = None
+    normal = None
+    obj = None
+
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
+
+        # ① 先沿相机局部 -Y 打
         hit, loc, normal, idx, obj, matrix = scene.ray_cast(
             depsgraph, origin, direction, distance=CAR_RAY_DISTANCE
         )
+
+        # ② 打空就退回世界 -Z（相机抬头/看平了也能标记 ✓）
+        if not hit or obj is None:
+            hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+                depsgraph, origin, Vector((0.0, 0.0, -1.0)),
+                distance=CAR_RAY_DISTANCE * 2.0
+            )
+            if hit and obj is not None:
+                print("[Blecaco][Car] 相机 -Y 未命中，改用竖直向下命中 ✓")
     except Exception as exc:                       # noqa: BLE001
         print(f"[Blecaco][Car] 地面射线异常：{exc}")
         return False
@@ -307,8 +347,12 @@ def _raycast_ground(origin: Vector):
     _center, fitted_normal, cam_height = _sample_and_fit_plane(center_hit)
 
     if fitted_normal is None or cam_height is None:
+        # 拟合失败：用中心点的高度 + 世界竖直法线
+        # ⚠️ 绝不能返回 0（那会把相机拽到地面 ✗）
         if CAR_GROUND_DEBUG:
-            print("[Blecaco][Car] 平面拟合失败，沿用单点法线")
+            print(
+                f"[Blecaco][Car] 平面拟合失败，用中心点高度 {center_hit.z:.3f}"
+            )
         return float(center_hit.z), Vector((0.0, 0.0, 1.0))
 
     if CAR_GROUND_DEBUG:
