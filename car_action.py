@@ -315,13 +315,20 @@ def _set_ground_by_ray() -> bool:
     # ★ 实测眼高：相机质心 → 命中点的距离 ✓
     #   用户自己决定相机放多高，代码不猜 ✗
     global _measured_eye_height
-    _measured_eye_height = (camera.location - loc).length
+    # 取【垂直高度】（相机 z - 命中点 z）✓ 而不是 3D 距离 ✗
+    # 斜着看时 3D 距离会大于真实离地高度 ✗
+    _measured_eye_height = camera.location.z - loc.z
 
     print(
         f"[Blecaco][Car] 地面已标记：{obj.name} "
         f"（命中高度 z={loc.z:.2f} 法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f})）"
     )
-    print(f"[Blecaco][Car] 实测眼高 = {_measured_eye_height:.3f} 单位")
+    if _measured_eye_height is not None and _measured_eye_height < 1e-6:
+        # 相机在命中点下方（比如俯视时打到了头顶的物体）→ 取绝对值兜底
+        _measured_eye_height = abs(_measured_eye_height)
+        print("[Blecaco][Car] 实测眼高为负，已取绝对值")
+
+    print(f"[Blecaco][Car] 实测垂直高度 = {_measured_eye_height:.3f} 单位")
     return True
 
 
