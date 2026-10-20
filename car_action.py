@@ -528,6 +528,7 @@ def handle_message(message):
     global _initial_camera_rotation, _steer_angle
     global _car_yaw, _last_message_time, _steer_lock
     global _steer_in_deadzone
+    global _last_heading, _ground_normal, _ground_z
 
     data = message.get("data", {})
 
@@ -576,7 +577,14 @@ def handle_message(message):
         _steer_in_deadzone = True
         _last_message_time = time.monotonic()
 
-        print("[Blecaco][Car] Initial camera rotation captured")
+        # ⚠️ 必须一并清空"地形对齐"的状态 ✗
+        # 否则 unlink → link 后，上一次的朝向/法线会被带过来 ✗
+        # 表现就是"上次的转向数据被转给了相机" ✗
+        _last_heading = None
+        _ground_normal = None
+        _ground_z = None
+
+        print("[Blecaco][Car] Initial camera rotation captured（转向/地形状态已清零）")
         return
 
     # 接收手机四元数
