@@ -146,6 +146,10 @@ CAR_PLANE_MAX_SLOPE_DEG: float = 75.0
 # HAS_GROUND == false 且射线打不到物体时，用这个平面当地面 ✓
 CAR_FLAT_PLANE_Z: float = 0.0
 
+# 上一次成功对齐时用的"水平朝向"（世界系水平单位向量）
+# 相机俯视接近垂直时，投影会退化 ✗ 用它兜底 → 不会 180° 掉头 ✓
+_last_heading: "Vector | None" = None
+
 # 当前拟合出的地面法线（None = 还没拟合出来）
 # 转向逻辑要把它并进目标姿态，否则每帧都会把地形对齐覆盖掉 ✗
 _ground_normal: "Vector | None" = None
@@ -392,18 +396,35 @@ def _align_quaternion_to_normal(q, normal: Vector):
     if slope_deg > CAR_ALIGN_MAX_SLOPE_DEG:
         return q
 
+    global _last_heading
+
     # 当前前方（-Z）
     forward = q @ Vector((0.0, 0.0, -1.0))
 
     # 去掉法线分量，投影到地面平面
-    forward = forward - normal * forward.dot(normal)
+    flat = forward - normal * forward.dot(normal)
 
-    if forward.length_squared < 1e-8:
-        forward = Vector((0.0, 1.0, 0.0)) - normal * normal.y
-        if forward.length_squared < 1e-8:
+    # ⚠️ 只有「投影退化」（相机几乎垂直俯视，投影长度趋近 0）才兜底
+    #    绝不能用一个固定的世界方向 ✗ 那会造成 180° 掉头 ✗
+    #    也不能用 dot<0 判定 ✗ 那会杀掉合法的掉头 ✗
+    if flat.length_squared < 0.04:
+        if _last_heading is not None:
+            # 把上次的水平朝向再投影一次（保证在平面上）
+            flat = _last_heading - normal * _last_heading.dot(normal)
+
+        if flat.length_squared < 1e-8:
+            if _last_heading is not None:
+                flat = _last_heading.copy()
+            else:
+                flat = Vector((0.0, 1.0, 0.0)) - normal * normal.y
+
+        if flat.length_squared < 1e-8:
             return q
 
-    forward.normalize()
+    forward = flat.normalized()
+
+    # 记录这次有效的水平朝向（下次退化时兜底用 ✓）
+    _last_heading = forward.copy()
 
     right = forward.cross(normal)
     if right.length_squared < 1e-8:
