@@ -427,7 +427,12 @@ def handle_message(message):
     global _car_yaw, _last_message_time, _steer_lock
     global _steer_in_deadzone
 
-    data = message.get("data", {})
+    # ground 消息是扁平结构（{"type":"ground","enabled":true}）
+    # action 消息才是嵌套的（{"type":"action","data":{...}}）
+    if message.get("type") == "ground":
+        data = message
+    else:
+        data = message.get("data", {})
 
     if not isinstance(data, dict):
         print("[Blecaco][Car] Invalid data")
@@ -439,7 +444,10 @@ def handle_message(message):
         return
 
     # 地面标记开关：手机长按 SetGround 切换
-    if data.get("command") == "set_ground":
+    # 支持两种消息形态：
+    #   {"type": "ground", "enabled": true}              ← 手机当前用法
+    #   {"command": "set_ground", "enabled": true}        ← 兼容旧写法
+    if message.get("type") == "ground" or data.get("command") == "set_ground":
         enabled = bool(data.get("enabled", False))
 
         if enabled:

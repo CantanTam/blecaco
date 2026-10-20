@@ -55,6 +55,10 @@ def _dispatch_message(raw_message: str) -> None:
     if message_type == "setting":
         module_name = "setting"
 
+    elif message_type == "ground":
+        # 地面标记命令（不受 action 门控，见 connection.gd 的 send_ground）
+        module_name = "car_action"
+
     elif message_type == "action":
         mode = str(data.get("mode", "")).lower()
         module_name = ACTION_MODULES.get(mode)
