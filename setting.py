@@ -1502,6 +1502,22 @@ def handle_message(data):
         _last_stream_settings = None
         return
 
+    # 地面标记命令（car_mode 长按 SetGround）
+    #   走 setting 通道是因为 SetGround 只在 unlink 显示，
+    #   而 unlink 会禁用 action 发送 ✗ setting 通道不受门控 ✓
+    if name == "ground":
+        try:
+            from . import car_action
+            car_action.handle_message({
+                "data": {
+                    "command": "set_ground",
+                    "enabled": bool(data.get("value", False)),
+                },
+            })
+        except Exception as exc:                   # noqa: BLE001
+            print(f"[blecaco] 地面命令处理失败：{exc}")
+        return
+
     # 手机打开摄像机页时会来要一份列表（value 是 null）→ 立刻回推，
     # 不等下一次 _watch_state 轮询，这样「打开页面就能看到」是确定的。
     if name == "cameras":
