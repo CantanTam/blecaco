@@ -118,25 +118,114 @@ CAR_GROUND_DEBUG: bool = False
 _ground_z: float | None = None
 
 
-def _raycast_ground(origin: Vector):
-    """从 origin 往下打射线。
+# 当前被标记为地面的物体（None = 还没标记）
+_ground_object = None
 
-    返回 (命中点高度, 地面法线) 或 (None, None)。
+
+def _find_tagged_ground():
+    """在场景里找带 is_ground 自定义属性的物体。"""
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if obj.get("is_ground", False):
+            return obj
+    return None
+
+
+def _clear_ground_tag() -> None:
+    """删掉所有物体的 is_ground 属性。"""
+    global _ground_object
+
+    count = 0
+    for obj in bpy.data.objects:
+        if obj.get("is_ground", False):
+            try:
+                del obj["is_ground"]
+                count += 1
+            except Exception as exc:              # noqa: BLE001
+                print(f"[Blecaco][Car] 删除 is_ground 失败（{obj.name}）：{exc}")
+
+    _ground_object = None
+    print(f"[Blecaco][Car] 已清除地面标记（{count} 个物体）")
+
+
+def _set_ground_by_ray() -> bool:
+    """沿相机局部 -Y（相机下方）打射线，把第一个命中的物体标记为地面。
+
+    返回是否成功标记。
     """
+    global _ground_object
+
+    _clear_ground_tag()
+
     scene = bpy.context.scene
+    camera = scene.camera
+
+    if camera is None:
+        print("[Blecaco][Car] 没有活动相机，无法设置地面")
+        return False
+
+    # 相机局部 -Y = 相机的"下方"
+    direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
+    origin = camera.location.copy()
 
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
-    except Exception:
+        hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+            depsgraph, origin, direction, distance=CAR_RAY_DISTANCE
+        )
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[Blecaco][Car] 地面射线异常：{exc}")
+        return False
+
+    if not hit or obj is None:
+        print("[Blecaco][Car] 相机下方没有物体，地面标记失败")
+        return False
+
+    # 打标
+    obj["is_ground"] = True
+    _ground_object = obj
+
+    print(
+        f"[Blecaco][Car] 地面已标记：{obj.name} "
+        f"（命中高度 z={loc.z:.2f} 法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f})）"
+    )
+    return True
+
+
+def _raycast_ground(origin: Vector):
+    """在「被标记为地面」的物体上打射线（只测那一个物体 ✓）。
+
+    返回 (命中点高度, 地面法线) 或 (None, None)。
+    """
+    global _ground_object
+
+    obj = _ground_object
+
+    if obj is None:
+        obj = _find_tagged_ground()
+        _ground_object = obj
+
+    if obj is None:
+        if CAR_GROUND_DEBUG:
+            print("[Blecaco][Car] 还没有标记地面物体")
+        return None, None
+
+    if obj.name not in bpy.context.scene.objects:
+        # 物体被删了 → 清空引用
+        _ground_object = None
         return None, None
 
     ray_start = origin.copy()
     ray_start.z += CAR_RAY_START_LIFT
 
     try:
-        hit, loc, normal, idx, obj, matrix = scene.ray_cast(
-            depsgraph, ray_start, Vector((0.0, 0.0, -1.0)),
-            distance=CAR_RAY_DISTANCE,
+        inv = obj.matrix_world.inverted()
+        local_origin = inv @ ray_start
+        local_dir = (inv.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+
+        hit, loc, normal, idx = obj.ray_cast(
+            local_origin, local_dir, distance=CAR_RAY_DISTANCE
         )
     except Exception as exc:                       # noqa: BLE001
         print(f"[Blecaco][Car] 地面探测异常：{exc}")
@@ -144,17 +233,25 @@ def _raycast_ground(origin: Vector):
 
     if not hit:
         if CAR_GROUND_DEBUG:
-            print("[Blecaco][Car] 地面探测未命中")
+            print(f"[Blecaco][Car] 在 {obj.name} 上未命中")
         return None, None
+
+    # 局部 → 世界
+    world_loc = obj.matrix_world @ loc
+    normal_matrix = obj.matrix_world.to_3x3().inverted().transposed()
+    world_normal = (normal_matrix @ normal).normalized()
+
+    # 法线可能朝下（背面），统一翻成朝上
+    if world_normal.z < 0.0:
+        world_normal = -world_normal
 
     if CAR_GROUND_DEBUG:
         print(
-            f"[Blecaco][Car] 地面命中 z={loc.z:.3f} "
-            f"法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f}) "
-            f"物体={obj.name if obj else '?'}"
+            f"[Blecaco][Car] 命中 {obj.name} z={world_loc.z:.3f} "
+            f"法线=({world_normal.x:.2f},{world_normal.y:.2f},{world_normal.z:.2f})"
         )
 
-    return float(loc.z), Vector(normal).normalized()
+    return float(world_loc.z), world_normal
 
 
 def _raycast_ground_height(origin: Vector):
@@ -312,6 +409,17 @@ def handle_message(message):
     # 兼容单独发送的 forward 消息
     if data.get("command") == "forward":
         _move_forward(float(data.get("distance", 0.1)))
+        return
+
+    # 地面标记开关：手机长按 SetGround 切换
+    if data.get("command") == "set_ground":
+        enabled = bool(data.get("enabled", False))
+
+        if enabled:
+            _set_ground_by_ray()
+        else:
+            _clear_ground_tag()
+
         return
 
     # 初始化：记录摄像机初始旋转
