@@ -76,9 +76,97 @@ print(
 # Car Mode 摄像机移动速度倍数
 CAR_MOVE_SPEED_MULTIPLIER: float = 5.0
 
+# ── 地面追踪（Level 2：跟随地形起伏）─────────────────────
+# 开启后：
+#   1) 前进方向压平到水平面（低头不会钻地、抬头不会飞天）
+#   2) 用射线向下探测地面，把相机抬到地面上方 EYE_HEIGHT
+CAR_GROUND_FOLLOW: bool = True
+
+# 相机离地面的高度（米）—— 相当于人眼/车载相机高度
+CAR_EYE_HEIGHT: float = 1.7
+
+# 向下探测地面的最大距离（米）—— 太短会检测不到高处的路，太长会穿到地下层
+CAR_RAY_DISTANCE: float = 200.0
+
+# 高度平滑时间常数（秒）—— 越大越平滑但越高低起伏迟钝；0 表示不平滑
+CAR_HEIGHT_SMOOTH_TAU: float = 0.08
+
+# 射线起点额外抬高，避免起点已经在地下时穿透
+CAR_RAY_START_LIFT: float = 10.0
+
+# 探测失败（比如走出地面范围）时：True=保持当前高度，False=回退到初始高度
+CAR_KEEP_HEIGHT_ON_MISS: bool = True
+
+# 调试：打印地面探测结果
+CAR_GROUND_DEBUG: bool = False
+
+# 运行时状态：平滑后的相机高度
+_ground_z: float | None = None
+
+
+def _raycast_ground_height(origin: Vector) -> float | None:
+    """从 origin 往下打射线，返回命中点的高度；没打中返回 None。"""
+    scene = bpy.context.scene
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception:
+        return None
+
+    ray_start = origin.copy()
+    ray_start.z += CAR_RAY_START_LIFT
+
+    try:
+        hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+            depsgraph, ray_start, Vector((0.0, 0.0, -1.0)),
+            distance=CAR_RAY_DISTANCE,
+        )
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[Blecaco][Car] 地面探测异常：{exc}")
+        return None
+
+    if not hit:
+        if CAR_GROUND_DEBUG:
+            print("[Blecaco][Car] 地面探测未命中")
+        return None
+
+    if CAR_GROUND_DEBUG:
+        print(f"[Blecaco][Car] 地面命中 z={loc.z:.3f} 物体={obj.name if obj else '?'}")
+
+    return float(loc.z)
+
+
+def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
+    """把 new_location 的 z 调整到地面 + EYE_HEIGHT（带平滑）。"""
+    global _ground_z
+
+    ground = _raycast_ground_height(new_location)
+
+    if ground is None:
+        if CAR_KEEP_HEIGHT_ON_MISS:
+            new_location.z = camera.location.z
+        return new_location
+
+    target_z = ground + CAR_EYE_HEIGHT
+
+    # 平滑：避免台阶/噪声导致高度突跳
+    if CAR_HEIGHT_SMOOTH_TAU <= 0.0 or _ground_z is None:
+        _ground_z = target_z
+    else:
+        alpha = 1.0 - math.exp(-max(delta, 0.0) / CAR_HEIGHT_SMOOTH_TAU)
+        _ground_z = _ground_z + (target_z - _ground_z) * alpha
+
+    new_location.z = _ground_z
+    return new_location
+
 
 def _move_forward(raw_distance: float) -> None:
-    """沿相机自身局部 -Z 方向前进。
+    """前进。
+
+    地面追踪关闭时：沿相机自身局部 -Z 方向自由移动（旧行为）。
+    地面追踪开启时：
+      1) 方向压平到水平面（低头不钻地、抬头不飞天）
+      2) 射线探测地面，把相机高度贴到地面上方 EYE_HEIGHT
 
     只修改 location，不写 matrix_world，
     避免位置与旋转数据互相覆盖。
@@ -91,9 +179,28 @@ def _move_forward(raw_distance: float) -> None:
 
     distance = raw_distance * CAR_MOVE_SPEED_MULTIPLIER
 
-    camera.location = camera.location + (
-        camera.rotation_quaternion @ Vector((0.0, 0.0, -distance))
-    )
+    # 相机朝向（-Z）→ 世界方向
+    forward = camera.rotation_quaternion @ Vector((0.0, 0.0, -1.0))
+
+    if CAR_GROUND_FOLLOW:
+        # 压平到水平面
+        forward.z = 0.0
+
+        # 正对着地面看时水平分量为零，用一个兜底方向避免卡死
+        if forward.length_squared < 1e-10:
+            forward = Vector((0.0, 1.0, 0.0))
+
+        forward.normalize()
+
+    new_location = camera.location + forward * distance
+
+    if CAR_GROUND_FOLLOW:
+        # 用移动距离粗略估计时间（速度恒定时距离正比于时间）
+        speed = max(abs(CAR_MOVE_SPEED_MULTIPLIER), 1e-3)
+        delta = abs(distance) / speed
+        new_location = _apply_ground_height(camera, new_location, delta)
+
+    camera.location = new_location
 
 
 def handle_message(message):
