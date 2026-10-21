@@ -42,6 +42,9 @@ GAME_FRICTION: float = 8.0
 # 低速时的兜底摩擦速度（避免速度趋近 0 时永远停不下来）
 GAME_STOP_SPEED: float = 0.5
 
+# 冲刺时的加速度比例（Apex 约 80% ✓ 起步"沉"一下更有重量感 ✓）
+GAME_SPRINT_ACCEL_RATIO: float = 0.8
+
 # 摇杆死区（0~1）：这个范围内视为无输入
 GAME_DEADZONE: float = 0.15
 
@@ -90,7 +93,12 @@ def _apply_friction(dt: float) -> None:
     _velocity *= new_speed / speed
 
 
-def _apply_acceleration(wishdir: Vector, wishspeed: float, dt: float) -> None:
+def _apply_acceleration(
+    wishdir: Vector,
+    wishspeed: float,
+    dt: float,
+    accel: float = GAME_ACCEL,
+) -> None:
     """加速：加速量受当前速度限制（越接近目标速度加得越慢）。"""
     global _velocity
 
@@ -100,7 +108,7 @@ def _apply_acceleration(wishdir: Vector, wishspeed: float, dt: float) -> None:
     if add_speed <= 0.0:
         return
 
-    accel_speed = GAME_ACCEL * dt * wishspeed
+    accel_speed = accel * dt * wishspeed
 
     if accel_speed > add_speed:
         accel_speed = add_speed
@@ -149,6 +157,16 @@ def handle_message(message) -> None:
     except (TypeError, ValueError):
         return
 
+    # 冲刺状态 + 倍率（由手机端按 RUN_SPEED 档位 + 迟滞算好）
+    sprinting = bool(data.get("sprint", False))
+
+    try:
+        run_multiplier = float(data.get("run_multiplier", 1.0))
+    except (TypeError, ValueError):
+        run_multiplier = 1.0
+
+    run_multiplier = max(1.0, min(2.0, run_multiplier))
+
     now = time.monotonic()
     dt = now - _last_message_time if _last_message_time > 0.0 else 0.0
     _last_message_time = now
@@ -164,6 +182,7 @@ def handle_message(message) -> None:
 
     wishdir = Vector((0.0, 0.0, 0.0))
     wishspeed = 0.0
+    base_speed = 0.0
 
     if depth > 0.0:
         # 相机局部轴投影到水平面（Z' = 相机 -Z 的水平投影）
@@ -192,13 +211,25 @@ def handle_message(message) -> None:
         if direction.length > 1e-6:
             wishdir = direction.normalized()
 
-        wishspeed = GAME_MAX_SPEED * depth
+        # 行走速度对所有档位一致 ✓
+        # 冲刺速度 = 行走速度 × 档位倍率 ✓
+        base_speed = GAME_MAX_SPEED * depth
+
+        if sprinting:
+            wishspeed = base_speed * run_multiplier
+        else:
+            wishspeed = base_speed
 
     # ── 摩擦 + 加速 ─────────────────────────────────────
     _apply_friction(dt)
 
     if wishdir.length > 1e-6 and wishspeed > 0.0:
-        _apply_acceleration(wishdir, wishspeed, dt)
+        # 方式 3：冲刺时加速度更低（更重、更"沉"）✓
+        accel = GAME_ACCEL * GAME_SPRINT_ACCEL_RATIO if sprinting else GAME_ACCEL
+
+        # 加速量用 wishspeed（Quake 原版 ✓）
+        #   加速度系数降为 80% 已经足够让冲刺起步变"沉" ✓
+        _apply_acceleration(wishdir, wishspeed, dt, accel)
 
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
     camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
@@ -206,6 +237,6 @@ def handle_message(message) -> None:
     if GAME_MOVE_DEBUG:
         print(
             f"[Blecaco][Game] rx={rx:+.2f} ry={ry:+.2f} "
-            f"depth={depth:.2f} |v|={_velocity.length:.3f} "
+            f"depth={depth:.2f} mult={run_multiplier:.2f} |v|={_velocity.length:.3f} "
             f"v=({_velocity.x:+.3f},{_velocity.y:+.3f})"
         )
