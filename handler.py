@@ -20,7 +20,7 @@ TIMER_INTERVAL = 0.01
 
 # Action 消息按 mode 分发到对应模块
 ACTION_MODULES = {
-    "game": "game",
+    "game": "game_action",
     "plane": "plane_action",
     "car": "car_action",
     "free": "free_action",
