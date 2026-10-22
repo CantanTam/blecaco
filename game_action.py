@@ -26,7 +26,7 @@ import math
 import time
 
 import bpy
-from mathutils import Vector
+from mathutils import Quaternion, Vector
 
 # ── game mode 的"贴地"标记（与 car_mode 的 is_ground 分开 ✗）──
 GAME_GROUND_TAG: str = "is_game_ground"
@@ -54,6 +54,13 @@ GAME_STOP_SPEED: float = 0.5
 
 # 冲刺时的加速度比例（Apex 约 80% ✓ 起步"沉"一下更有重量感 ✓）
 GAME_SPRINT_ACCEL_RATIO: float = 0.8
+
+# ── 视角旋转（FPS 式）───────────────────────────────
+# 满偏时的角速度（度/秒）
+GAME_LOOK_YAW_SPEED: float = 120.0      # 世界 Z 轴（左右）
+GAME_LOOK_PITCH_SPEED: float = 90.0     # 相机局部 X 轴（上下）
+# 俯仰上限（±89° ✓）
+GAME_LOOK_PITCH_LIMIT: float = 89.0
 
 # 摇杆死区（0~1）：这个范围内视为无输入
 GAME_DEADZONE: float = 0.15
@@ -328,6 +335,43 @@ def _follow_game_ground(camera) -> None:
     ))
 
 
+def _apply_look(camera, look_x: float, look_y: float, dt: float) -> None:
+    """FPS 式视角旋转。
+
+    look_y > 0（手指往下）→ 绕【相机局部 X 轴】向下转 ✓
+    look_x > 0（手指往右）→ 绕【世界 Z 轴】向右转 ✓
+    俯仰限制在 ±GAME_LOOK_PITCH_LIMIT 度内 ✓
+    """
+    if abs(look_x) < 1e-4 and abs(look_y) < 1e-4:
+        return
+
+    quat = camera.rotation_quaternion
+
+    # ① 左右：绕世界 Z 轴（前乘 ✓）
+    if abs(look_x) > 1e-4:
+        yaw = math.radians(GAME_LOOK_YAW_SPEED * dt * look_x)
+        quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
+
+    # ② 上下：绕相机局部 X 轴（后乘 ✓）
+    if abs(look_y) > 1e-4:
+        pitch = math.radians(GAME_LOOK_PITCH_SPEED * dt * look_y)
+        quat = quat @ Quaternion((1.0, 0.0, 0.0), pitch)
+
+        # 俯仰限位：看前方向量的 Z 分量不能超过 sin(limit) ✓
+        forward = quat @ Vector((0.0, 0.0, -1.0))
+        limit_sin = math.sin(math.radians(GAME_LOOK_PITCH_LIMIT))
+
+        if abs(forward.z) > limit_sin:
+            # 超限 → 撤销这次 pitch
+            quat = camera.rotation_quaternion
+
+            if abs(look_x) > 1e-4:
+                yaw = math.radians(GAME_LOOK_YAW_SPEED * dt * look_x)
+                quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
+
+    camera.rotation_quaternion = quat
+
+
 def handle_message(message) -> None:
     global _last_message_time
 
@@ -451,6 +495,15 @@ def handle_message(message) -> None:
 
     # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
     _follow_game_ground(camera)
+
+    # ── 视角旋转（FPS 式）──────────────────────────────
+    try:
+        look_x = float(data.get("look_x", 0.0))
+        look_y = float(data.get("look_y", 0.0))
+    except (TypeError, ValueError):
+        look_x = look_y = 0.0
+
+    _apply_look(camera, look_x, look_y, dt)
 
     if GAME_MOVE_DEBUG:
         print(
