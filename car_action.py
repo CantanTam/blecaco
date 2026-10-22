@@ -155,6 +155,11 @@ CAR_FLAT_PLANE_Z: float = 0.0
 # 网格边长缓存（物体名 → 边长）——它不会变 ✓ 缓存起来避免每帧重算 ✗
 _mesh_cell_cache: "dict[str, float]" = {}
 
+# 移动中实时检测：相机下方第一个物体是否带 is_ground
+_under_is_ground: "bool | None" = None     # None = 还没检测过
+_under_check_time: float = 0.0
+UNDER_CHECK_INTERVAL: float = 0.1          # 每 100ms 检测一次（够实时，也不费）
+
 # 实测眼高：SetGround 时量出的"相机质心 → 地面命中点"距离 ✓
 # 之后所有高度跟踪都用它（不再用固定的 CAR_EYE_HEIGHT ✗）
 _measured_eye_height: "float | None" = None
@@ -187,6 +192,73 @@ def _eye_height() -> float:
         return _measured_eye_height
 
     return abs(CAR_EYE_HEIGHT)
+
+
+def _notify_ground_indicator(has_ground: bool) -> None:
+    """把"相机下方是否踩在 is_ground 物体上"推给手机（用于图标+闪烁提示）。"""
+    from . import streamer as _streamer
+
+    server = getattr(_streamer._state, "server", None)
+
+    if server is None:
+        return
+
+    try:
+        server.send_text(json.dumps({
+            "type": "ground_indicator",
+            "has_ground": bool(has_ground),
+        }))
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[Blecaco][Car] ground_indicator 发送失败：{exc}")
+
+
+def _check_under_camera() -> None:
+    """沿相机局部 -Y 打射线，看第一个命中的物体是否带 is_ground。
+
+    只在状态【变化】时才推送 ✗ 避免每帧刷消息 ✗
+    """
+    global _under_is_ground, _under_check_time
+
+    now = time.monotonic()
+
+    if now - _under_check_time < UNDER_CHECK_INTERVAL:
+        return
+
+    _under_check_time = now
+
+    scene = bpy.context.scene
+    camera = scene.camera
+
+    if camera is None:
+        return
+
+    direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+            depsgraph, camera.location, direction, distance=CAR_RAY_DISTANCE
+        )
+    except Exception:                              # noqa: BLE001
+        return
+
+    has_ground = False
+
+    if hit and obj is not None:
+        try:
+            has_ground = bool(obj.get("is_ground", False))
+        except ReferenceError:
+            has_ground = False
+
+    if _under_is_ground is None or has_ground != _under_is_ground:
+        _under_is_ground = has_ground
+        _notify_ground_indicator(has_ground)
+
+        if CAR_GROUND_DEBUG:
+            print(
+                f"[Blecaco][Car] 脚下地面 is_ground = {has_ground}"
+                f"（{obj.name if hit and obj else '无物体'}）"
+            )
 
 
 def _find_tagged_ground():
@@ -655,6 +727,9 @@ def handle_message(message):
         _ground_normal = None
         _ground_z = None
 
+        global _under_is_ground
+        _under_is_ground = None
+
         global _target_location, _last_dt
         _target_location = camera.location.copy()   # ← 用当前相机位置做起点 ✓
         _last_dt = 0.0
@@ -831,6 +906,9 @@ def handle_message(message):
     # 处理同一条姿态消息中的前进量
     if forward != 0.0:
         _move_forward(forward)
+
+        # 移动中：实时检测脚下物体是否带 is_ground → 状态变化时推送手机 ✓
+        _check_under_camera()
 
 # ============================================================
 # 局部平面拟合（把"单个三角面法线"换成"邻域拟合平面" ✓）
