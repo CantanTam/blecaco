@@ -339,7 +339,9 @@ def _follow_game_ground(camera) -> None:
     ))
 
 
-def _apply_look(camera, look_dx: float, look_dy: float) -> None:
+def _apply_look(
+    camera, look_dx: float, look_dy: float, multiplier: float = 1.0
+) -> None:
     """FPS 式视角旋转（直接映射 ✓ 拖多少转多少，松手即停）。
 
     look_dx > 0（手指右滑）→ 绕【世界 Z 轴】向右转 ✓
@@ -354,13 +356,13 @@ def _apply_look(camera, look_dx: float, look_dy: float) -> None:
     # ① 左右：绕世界 Z 轴（前乘 ✓）
     #   手指右 → 相机右转 → 绕 +Z 顺时针 = 负角 ✓
     if abs(look_dx) > 1e-4:
-        yaw = math.radians(-GAME_LOOK_YAW_DEG_PER_PX * look_dx)
+        yaw = math.radians(-GAME_LOOK_YAW_DEG_PER_PX * look_dx * multiplier)
         quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
 
     # ② 上下：绕相机局部 X 轴（后乘 ✓）
     if abs(look_dy) > 1e-4:
         # 手指上（look_dy < 0）→ 抬头 → 局部 X 正角 ✓
-        pitch = math.radians(-GAME_LOOK_PITCH_DEG_PER_PX * look_dy)
+        pitch = math.radians(-GAME_LOOK_PITCH_DEG_PER_PX * look_dy * multiplier)
         candidate = quat @ Quaternion((1.0, 0.0, 0.0), pitch)
 
         # 俯仰限位：看前方向量的 Z 分量不能超过 sin(limit) ✓
@@ -501,10 +503,13 @@ def handle_message(message) -> None:
     try:
         look_dx = float(data.get("look_dx", 0.0))
         look_dy = float(data.get("look_dy", 0.0))
+        look_mult = float(data.get("look_multiplier", 1.0))
     except (TypeError, ValueError):
         look_dx = look_dy = 0.0
+        look_mult = 1.0
 
-    _apply_look(camera, look_dx, look_dy)
+    look_mult = max(0.3, min(3.0, look_mult))
+    _apply_look(camera, look_dx, look_dy, look_mult)
 
     if GAME_MOVE_DEBUG:
         print(
