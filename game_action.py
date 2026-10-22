@@ -85,9 +85,8 @@ GAME_LOOK_PITCH_LIMIT: float = 89.0
 
 # ── 奔跑抖动（位移抖动，振幅按身体尺度比例 ✓）──────────
 RUN_SHAKING_ENABLED: bool = True      # 默认开
-# ⚠️ 临时放大 10 倍用于验证抖动是否存在（确认后改回 0.025 / 0.015）
-SHAKE_VERTICAL_RATIO: float = 0.25    # 垂直振幅 = 参考距离 × 2.5%  （临时×10）
-SHAKE_LATERAL_RATIO: float = 0.15     # 横向振幅 = 参考距离 × 1.5%  （临时×10）
+SHAKE_VERTICAL_RATIO: float = 0.025   # 垂直振幅 = 参考距离 × 2.5%（1.8m → ±4.5cm）
+SHAKE_LATERAL_RATIO: float = 0.015    # 横向振幅 = 参考距离 × 1.5%（1.8m → ±2.7cm）
 SHAKE_STEP_HZ: float = 1.9            # 步频（人类跑步 ≈1.8~2 步/秒）
 SHAKE_SMOOTH_TAU: float = 0.15        # 抖动淡入淡出
 
