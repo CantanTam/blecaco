@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 
@@ -134,6 +135,79 @@ def _stick_to_depth(magnitude: float) -> float:
     depth = max(0.0, min(1.0, depth))
 
     return depth**GAME_CURVE_POWER
+
+
+# 脚下检测状态（100ms 节流 ✓）
+_under_has_surface: bool = False
+_under_is_game_ground: "bool | None" = None
+_under_time: float = 0.0
+UNDER_CHECK_INTERVAL: float = 0.1
+
+
+def _notify_game_indicator(has_ground: bool) -> None:
+    """推给手机：脚下是否有物体 + 该物体是否带 is_game_ground。"""
+    from . import streamer as _streamer
+
+    server = getattr(_streamer._state, "server", None)
+
+    if server is None:
+        return
+
+    try:
+        server.send_text(json.dumps({
+            "type": "ground_indicator",
+            "has_ground": bool(has_ground),
+            "has_surface": bool(_under_has_surface),
+        }))
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[Blecaco][Game] ground_indicator 发送失败：{exc}")
+
+
+def _check_under_game_camera() -> None:
+    """沿相机 -Y 打射线，判断脚下是否有物体、是否带 is_game_ground。"""
+    global _under_has_surface, _under_is_game_ground, _under_time
+
+    now = time.monotonic()
+
+    if now - _under_time < UNDER_CHECK_INTERVAL:
+        return
+
+    _under_time = now
+
+    camera = bpy.context.scene.camera
+
+    if camera is None:
+        return
+
+    direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hit, loc, normal, idx, obj, matrix = bpy.context.scene.ray_cast(
+            depsgraph, camera.location, direction, distance=1000.0
+        )
+    except Exception:                              # noqa: BLE001
+        return
+
+    has_surface = bool(hit and obj is not None)
+    has_ground = False
+
+    if has_surface:
+        try:
+            has_ground = bool(obj.get(GAME_GROUND_TAG, False))
+        except ReferenceError:
+            has_surface = False
+
+    surface_changed = has_surface != _under_has_surface
+    _under_has_surface = has_surface
+
+    if (
+        _under_is_game_ground is None
+        or has_ground != _under_is_game_ground
+        or surface_changed
+    ):
+        _under_is_game_ground = has_ground
+        _notify_game_indicator(has_ground)
 
 
 def _find_tagged_game_ground():
@@ -288,6 +362,9 @@ def handle_message(message) -> None:
         _last_message_time = time.monotonic()
         print("[Blecaco][Game] Game mode initialized（速度已清零）")
         return
+
+    # 每条消息都检测脚下（100ms 节流 ✓）→ 手机据此判断能否长按 ✓
+    _check_under_game_camera()
 
     try:
         rx = float(data.get("rx", 0.0))
