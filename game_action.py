@@ -58,8 +58,11 @@ GAME_SPRINT_ACCEL_RATIO: float = 0.8
 # ── 视角旋转（FPS 式）───────────────────────────────
 # 直接映射：每滑动 1 像素转多少度（三角洲 / 主流手机 FPS 手感 ✓）
 #   横屏约 2400px 宽 → 0.15°/px × 2400 = 360°（一屏刚好转一圈 ✓）
-GAME_LOOK_YAW_DEG_PER_PX: float = 0.15
-GAME_LOOK_PITCH_DEG_PER_PX: float = 0.12
+# 业界主流（PUBG / 三角洲 / Apex 默认档）：
+#   滑满一屏宽 1920px × 0.12 = 230°
+#   滑满一屏高 1080px × 0.09 =  97°
+GAME_LOOK_YAW_DEG_PER_PX: float = 0.12
+GAME_LOOK_PITCH_DEG_PER_PX: float = 0.09
 # 俯仰上限（±89° ✓）
 GAME_LOOK_PITCH_LIMIT: float = 89.0
 
