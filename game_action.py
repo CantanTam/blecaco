@@ -90,6 +90,12 @@ SHAKE_LATERAL_RATIO: float = 0.015    # 横向振幅 = 参考距离 × 1.5%（1.
 SHAKE_STEP_HZ: float = 1.9            # 步频（人类跑步 ≈1.8~2 步/秒）
 SHAKE_SMOOTH_TAU: float = 0.15        # 抖动淡入淡出
 
+# ── 相机防撞（方案 B：6 方向射线 + 滑动）───────────────
+WALL_COLLISION_ENABLED: bool = True
+# 阈值：参考距离代表 1.8 米时，阈值为 10 厘米（按比例缩放 ✓）
+WALL_COLLISION_CM: float = 10.0
+GAME_BODY_HEIGHT_M_REF: float = 1.8
+
 # 摇杆死区（0~1）：这个范围内视为无输入
 GAME_DEADZONE: float = 0.15
 
@@ -460,6 +466,79 @@ def _apply_shake(camera, speed_ratio: float, dt: float) -> None:
     _shake_prev = offset
 
 
+def _wall_threshold_units() -> float:
+    """防撞阈值（当前场景单位）。"""
+    if _ground_reference_distance <= 1e-6:
+        return 0.0
+
+    meters_per_unit = GAME_BODY_HEIGHT_M_REF / _ground_reference_distance
+    return (WALL_COLLISION_CM / 100.0) / meters_per_unit
+
+
+def _apply_wall_collision(camera, wishdir: Vector) -> Vector:
+    """6 方向短射线 + 把 wishdir 投影到表面（沿墙滑动 ✓）。
+
+    只检查【朝向墙面】的方向，跳过地面物体本身 ✗
+    """
+    if not WALL_COLLISION_ENABLED:
+        return wishdir
+
+    threshold = _wall_threshold_units()
+
+    if threshold <= 1e-6 or wishdir.length_squared < 1e-12:
+        return wishdir
+
+    scene = bpy.context.scene
+    quat = camera.rotation_quaternion
+
+    # 相机局部 6 个方向
+    axes = [
+        quat @ Vector((1.0, 0.0, 0.0)),
+        quat @ Vector((-1.0, 0.0, 0.0)),
+        quat @ Vector((0.0, 0.0, -1.0)),
+        quat @ Vector((0.0, 0.0, 1.0)),
+        quat @ Vector((0.0, 1.0, 0.0)),
+        quat @ Vector((0.0, -1.0, 0.0)),
+    ]
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception:                              # noqa: BLE001
+        return wishdir
+
+    result = wishdir.copy()
+
+    for d in axes:
+        d = d.normalized()
+
+        # 只在"朝着这个方向走"时才检测 ✓
+        if result.dot(d) <= 1e-4:
+            continue
+
+        try:
+            hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+                depsgraph, camera.location, d, distance=threshold
+            )
+        except Exception:                          # noqa: BLE001
+            continue
+
+        if not hit or obj is None:
+            continue
+
+        # 跳过地面物体本身 ✗（否则垂直移动会被永久禁止 ✗）
+        try:
+            if obj.get(GAME_GROUND_TAG, False):
+                continue
+        except ReferenceError:
+            continue
+
+        # 把速度投影到表面（滑过去 ✓）
+        n = Vector(normal).normalized()
+        result = result - n * result.dot(n)
+
+    return result
+
+
 def _apply_look(
     camera, look_dx: float, look_dy: float, multiplier: float = 1.0
 ) -> None:
@@ -552,6 +631,10 @@ def handle_message(message) -> None:
     except (TypeError, ValueError):
         RUN_SHAKING_ENABLED = True
 
+    # WALL_COLLISION 开关
+    global WALL_COLLISION_ENABLED
+    WALL_COLLISION_ENABLED = bool(data.get("wall_collision", True))
+
     # 冲刺状态 + 倍率（由手机端按 RUN_SPEED 档位 + 迟滞算好）
     sprinting = bool(data.get("sprint", False))
 
@@ -605,6 +688,12 @@ def handle_message(message) -> None:
         # 归一化：斜向不会快 41% ✓
         if direction.length > 1e-6:
             wishdir = direction.normalized()
+
+        # ── 相机防撞（6 方向射线 + 滑动 ✓）────────────────
+        wishdir = _apply_wall_collision(camera, wishdir)
+
+        if wishdir.length > 1e-6:
+            wishdir = wishdir.normalized()
 
         # 行走速度对所有档位一致 ✓
         # 冲刺速度 = 行走速度 × 档位倍率 ✓
