@@ -96,6 +96,12 @@ WALL_COLLISION_ENABLED: bool = True
 WALL_COLLISION_CM: float = 10.0
 GAME_BODY_HEIGHT_M_REF: float = 1.8
 
+# 没做 SetBodyHeight 标定时的兜底阈值（当前场景单位）
+WALL_COLLISION_FALLBACK_UNITS: float = 0.5
+
+# 调试：打印每次命中的墙
+WALL_DEBUG: bool = True
+
 # 摇杆死区（0~1）：这个范围内视为无输入
 GAME_DEADZONE: float = 0.15
 
@@ -467,9 +473,13 @@ def _apply_shake(camera, speed_ratio: float, dt: float) -> None:
 
 
 def _wall_threshold_units() -> float:
-    """防撞阈值（当前场景单位）。"""
+    """防撞阈值（当前场景单位）。
+
+    有标定 → 10cm 换算；没标定 → 用兜底绝对值 ✓
+    """
     if _ground_reference_distance <= 1e-6:
-        return 0.0
+        # ⚠️ 没做 SetBodyHeight 时也要能防撞 ✗ 用兜底值 ✓
+        return WALL_COLLISION_FALLBACK_UNITS
 
     meters_per_unit = GAME_BODY_HEIGHT_M_REF / _ground_reference_distance
     return (WALL_COLLISION_CM / 100.0) / meters_per_unit
@@ -532,6 +542,12 @@ def _apply_wall_collision(camera, wishdir: Vector, velocity: Vector) -> tuple:
                 continue
         except ReferenceError:
             continue
+
+        if WALL_DEBUG:
+            print(
+                f"[Blecaco][Game] 防撞命中 {obj.name} "
+                f"距离={threshold:.3f} 法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f})"
+            )
 
         # 把【输入方向】投影到表面（滑过去 ✓）
         n = Vector(normal).normalized()
