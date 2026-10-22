@@ -44,6 +44,9 @@ _reference_valid: bool = False
 _shake_amp: float = 0.0
 _shake_time: float = 0.0
 
+# 上一帧施加的抖动偏移（必须先撤销，否则横向会累积漂移 ✗）
+_shake_prev: Vector = Vector((0.0, 0.0, 0.0))
+
 
 # ── 手感参数（参考 CS:GO / Apex）───────────────────────────
 # 最大移动速度（单位/秒）
@@ -416,7 +419,12 @@ def _apply_shake(camera, speed_ratio: float, dt: float) -> None:
     振幅按【参考距离】比例缩放 ✓（尺度无关）
     垂直 = 2×步频，横向 = 1×步频（错开相位 ✓）
     """
-    global _shake_amp, _shake_time
+    global _shake_amp, _shake_time, _shake_prev
+
+    # ★ 只撤销【横向】分量 ✓
+    #   Z 已经被 _follow_game_ground 重置过，不能再减 ✗（会重复抵消 ✗）
+    camera.location = camera.location - Vector((_shake_prev.x, _shake_prev.y, 0.0))
+    _shake_prev = Vector((0.0, 0.0, 0.0))
 
     if not RUN_SHAKING_ENABLED or _ground_reference_distance <= 1e-6:
         target = 0.0
@@ -448,7 +456,9 @@ def _apply_shake(camera, speed_ratio: float, dt: float) -> None:
     else:
         right_flat = Vector((1.0, 0.0, 0.0))
 
-    camera.location = camera.location + Vector((0.0, 0.0, dv)) + right_flat * dh
+    offset = Vector((0.0, 0.0, dv)) + right_flat * dh
+    camera.location = camera.location + offset
+    _shake_prev = offset
 
 
 def _apply_look(
