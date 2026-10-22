@@ -536,12 +536,9 @@ def _apply_wall_collision(camera, wishdir: Vector, velocity: Vector) -> tuple:
         if not hit or obj is None:
             continue
 
-        # 跳过地面物体本身 ✗（否则垂直移动会被永久禁止 ✗）
-        try:
-            if obj.get(GAME_GROUND_TAG, False):
-                continue
-        except ReferenceError:
-            continue
+        # ⚠️ 不再跳过地面物体 ✗
+        #   移动速度是【水平】的 → 向下的射线根本不会被检测（dot <= 0 ✓）
+        #   而"撞山坡"撞的就是地面物体 ✓ 跳过它就等于没防撞 ✗
 
         if WALL_DEBUG:
             print(
@@ -763,7 +760,7 @@ def handle_message(message) -> None:
                 hit2, loc2, n2, i2, o2, m2 = bpy.context.scene.ray_cast(
                     dg, camera.location, d, distance=th
                 )
-                if hit2 and o2 is not None and not o2.get(GAME_GROUND_TAG, False):
+                if hit2 and o2 is not None:
                     camera.location = prev_location
                     _velocity = Vector((0.0, 0.0, 0.0))
         except Exception:                          # noqa: BLE001
