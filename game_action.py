@@ -40,6 +40,10 @@ _ground_reference_distance: float = 0.0
 # 是否已确定有效参考（False = 用兜底 GAME_MAX_SPEED）
 _reference_valid: bool = False
 
+# 抖动平滑后的振幅（0 = 不抖）
+_shake_amp: float = 0.0
+_shake_time: float = 0.0
+
 
 # ── 手感参数（参考 CS:GO / Apex）───────────────────────────
 # 最大移动速度（单位/秒）
@@ -75,6 +79,13 @@ GAME_LOOK_YAW_DEG_PER_PX: float = 0.12
 GAME_LOOK_PITCH_DEG_PER_PX: float = 0.09
 # 俯仰上限（±89° ✓）
 GAME_LOOK_PITCH_LIMIT: float = 89.0
+
+# ── 奔跑抖动（位移抖动，振幅按身体尺度比例 ✓）──────────
+RUN_SHAKING_ENABLED: bool = True      # 默认开
+SHAKE_VERTICAL_RATIO: float = 0.025   # 垂直振幅 = 参考距离 × 2.5%
+SHAKE_LATERAL_RATIO: float = 0.015    # 横向振幅 = 参考距离 × 1.5%
+SHAKE_STEP_HZ: float = 1.9            # 步频（人类跑步 ≈1.8~2 步/秒）
+SHAKE_SMOOTH_TAU: float = 0.15        # 抖动淡入淡出
 
 # 摇杆死区（0~1）：这个范围内视为无输入
 GAME_DEADZONE: float = 0.15
@@ -398,6 +409,47 @@ def _follow_game_ground(camera) -> None:
     ))
 
 
+def _apply_shake(camera, speed_ratio: float, dt: float) -> None:
+    """位移抖动：模拟跑步时的头部上下/左右运动。
+
+    振幅按【参考距离】比例缩放 ✓（尺度无关）
+    垂直 = 2×步频，横向 = 1×步频（错开相位 ✓）
+    """
+    global _shake_amp, _shake_time
+
+    if not RUN_SHAKING_ENABLED or _ground_reference_distance <= 1e-6:
+        target = 0.0
+    else:
+        # sqrt 让慢跑也有明显起伏 ✓
+        target = math.sqrt(max(0.0, min(1.0, speed_ratio)))
+
+    k = 1.0 - math.exp(-max(dt, 0.0) / SHAKE_SMOOTH_TAU)
+    _shake_amp += (target - _shake_amp) * k
+
+    if _shake_amp < 1e-4:
+        return
+
+    _shake_time += dt
+
+    amp_v = _ground_reference_distance * SHAKE_VERTICAL_RATIO * _shake_amp
+    amp_h = _ground_reference_distance * SHAKE_LATERAL_RATIO * _shake_amp
+
+    w = 2.0 * math.pi * SHAKE_STEP_HZ
+
+    dv = math.sin(_shake_time * w * 2.0) * amp_v
+    dh = math.sin(_shake_time * w * 1.0) * amp_h
+
+    # 横向沿相机右方向 ✓
+    right = camera.rotation_quaternion @ Vector((1.0, 0.0, 0.0))
+    right_flat = Vector((right.x, right.y, 0.0))
+    if right_flat.length > 1e-5:
+        right_flat.normalize()
+    else:
+        right_flat = Vector((1.0, 0.0, 0.0))
+
+    camera.location = camera.location + Vector((0.0, 0.0, dv)) + right_flat * dh
+
+
 def _apply_look(
     camera, look_dx: float, look_dy: float, multiplier: float = 1.0
 ) -> None:
@@ -435,7 +487,7 @@ def _apply_look(
 
 
 def handle_message(message) -> None:
-    global _last_message_time
+    global _last_message_time, RUN_SHAKING_ENABLED, _velocity
 
     data = message.get("data", {})
 
@@ -482,6 +534,13 @@ def handle_message(message) -> None:
         ry = float(data.get("ry", 0.0))
     except (TypeError, ValueError):
         return
+
+    # RUN_SHAKING 开关（同时控制"抖动"和"snappy 加减速"✓）
+    #   ⚠️ 必须在速度计算之前读 ✗
+    try:
+        RUN_SHAKING_ENABLED = bool(data.get("run_shaking", True))
+    except (TypeError, ValueError):
+        RUN_SHAKING_ENABLED = True
 
     # 冲刺状态 + 倍率（由手机端按 RUN_SPEED 档位 + 迟滞算好）
     sprinting = bool(data.get("sprint", False))
@@ -547,9 +606,16 @@ def handle_message(message) -> None:
             wishspeed = base_speed
 
     # ── 摩擦 + 加速 ─────────────────────────────────────
-    _apply_friction(dt)
+    if not RUN_SHAKING_ENABLED:
+        # 关闭 snappy：直接等于目标速度（立即启停 ✓ 无惯性 ✓）
+        if wishdir.length > 1e-6 and wishspeed > 0.0:
+            _velocity = wishdir * wishspeed
+        else:
+            _velocity = Vector((0.0, 0.0, 0.0))
+    else:
+        _apply_friction(dt)
 
-    if wishdir.length > 1e-6 and wishspeed > 0.0:
+    if RUN_SHAKING_ENABLED and wishdir.length > 1e-6 and wishspeed > 0.0:
         # 方式 3：冲刺时加速度更低（更重、更"沉"）✓
         accel = GAME_ACCEL * GAME_SPRINT_ACCEL_RATIO if sprinting else GAME_ACCEL
 
@@ -563,6 +629,13 @@ def handle_message(message) -> None:
     # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
     _follow_game_ground(camera)
 
+    # ── 奔跑抖动（位移 ✓ 在贴地之后加，下一帧会被覆盖 ✓ 不漂移 ✓）──
+    speed_ratio = 0.0
+    if wishspeed > 1e-6:
+        speed_ratio = min(1.0, _velocity.length / wishspeed)
+
+    _apply_shake(camera, speed_ratio, dt)
+
     # ── 视角旋转（FPS 式）──────────────────────────────
     try:
         look_dx = float(data.get("look_dx", 0.0))
@@ -573,6 +646,8 @@ def handle_message(message) -> None:
         look_mult = 1.0
 
     look_mult = max(0.3, min(3.0, look_mult))
+
+
 
     _apply_look(camera, look_dx, look_dy, look_mult)
 
