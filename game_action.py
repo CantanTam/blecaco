@@ -56,11 +56,10 @@ GAME_STOP_SPEED: float = 0.5
 GAME_SPRINT_ACCEL_RATIO: float = 0.8
 
 # ── 视角旋转（FPS 式）───────────────────────────────
-# 满偏时的角速度（度/秒）
-#   FPS 手感参考：满偏 60°/s ≈ 6 秒转一整圈（偏慢、稳）
-#                 满偏 120°/s ≈ 3 秒转一整圈（偏快）
-GAME_LOOK_YAW_SPEED: float = 60.0       # 世界 Z 轴（左右）
-GAME_LOOK_PITCH_SPEED: float = 45.0     # 相机局部 X 轴（上下）
+# 直接映射：每滑动 1 像素转多少度（三角洲 / 主流手机 FPS 手感 ✓）
+#   横屏约 2400px 宽 → 0.15°/px × 2400 = 360°（一屏刚好转一圈 ✓）
+GAME_LOOK_YAW_DEG_PER_PX: float = 0.15
+GAME_LOOK_PITCH_DEG_PER_PX: float = 0.12
 # 俯仰上限（±89° ✓）
 GAME_LOOK_PITCH_LIMIT: float = 89.0
 
@@ -337,41 +336,36 @@ def _follow_game_ground(camera) -> None:
     ))
 
 
-def _apply_look(camera, look_x: float, look_y: float, dt: float) -> None:
-    """FPS 式视角旋转。
+def _apply_look(camera, look_dx: float, look_dy: float) -> None:
+    """FPS 式视角旋转（直接映射 ✓ 拖多少转多少，松手即停）。
 
-    look_y > 0（手指往下）→ 绕【相机局部 X 轴】向下转 ✓
-    look_x > 0（手指往右）→ 绕【世界 Z 轴】向右转 ✓
+    look_dx > 0（手指右滑）→ 绕【世界 Z 轴】向右转 ✓
+    look_dy > 0（手指下滑）→ 绕【相机局部 X 轴】低头 ✓
     俯仰限制在 ±GAME_LOOK_PITCH_LIMIT 度内 ✓
     """
-    if abs(look_x) < 1e-4 and abs(look_y) < 1e-4:
+    if abs(look_dx) < 1e-4 and abs(look_dy) < 1e-4:
         return
 
     quat = camera.rotation_quaternion
 
     # ① 左右：绕世界 Z 轴（前乘 ✓）
-    #   手指右（look_x > 0）→ 相机右转 → 绕 +Z 顺时针 = 负角 ✓
-    if abs(look_x) > 1e-4:
-        yaw = math.radians(-GAME_LOOK_YAW_SPEED * dt * look_x)
+    #   手指右 → 相机右转 → 绕 +Z 顺时针 = 负角 ✓
+    if abs(look_dx) > 1e-4:
+        yaw = math.radians(-GAME_LOOK_YAW_DEG_PER_PX * look_dx)
         quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
 
     # ② 上下：绕相机局部 X 轴（后乘 ✓）
-    if abs(look_y) > 1e-4:
-        # 手指上（look_y < 0）→ 抬头 → 绕局部 X 正角 ✓
-        pitch = math.radians(-GAME_LOOK_PITCH_SPEED * dt * look_y)
-        quat = quat @ Quaternion((1.0, 0.0, 0.0), pitch)
+    if abs(look_dy) > 1e-4:
+        # 手指上（look_dy < 0）→ 抬头 → 局部 X 正角 ✓
+        pitch = math.radians(-GAME_LOOK_PITCH_DEG_PER_PX * look_dy)
+        candidate = quat @ Quaternion((1.0, 0.0, 0.0), pitch)
 
         # 俯仰限位：看前方向量的 Z 分量不能超过 sin(limit) ✓
-        forward = quat @ Vector((0.0, 0.0, -1.0))
+        forward = candidate @ Vector((0.0, 0.0, -1.0))
         limit_sin = math.sin(math.radians(GAME_LOOK_PITCH_LIMIT))
 
-        if abs(forward.z) > limit_sin:
-            # 超限 → 撤销这次 pitch
-            quat = camera.rotation_quaternion
-
-            if abs(look_x) > 1e-4:
-                yaw = math.radians(-GAME_LOOK_YAW_SPEED * dt * look_x)
-                quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
+        if abs(forward.z) <= limit_sin:
+            quat = candidate
 
     camera.rotation_quaternion = quat
 
@@ -502,12 +496,12 @@ def handle_message(message) -> None:
 
     # ── 视角旋转（FPS 式）──────────────────────────────
     try:
-        look_x = float(data.get("look_x", 0.0))
-        look_y = float(data.get("look_y", 0.0))
+        look_dx = float(data.get("look_dx", 0.0))
+        look_dy = float(data.get("look_dy", 0.0))
     except (TypeError, ValueError):
-        look_x = look_y = 0.0
+        look_dx = look_dy = 0.0
 
-    _apply_look(camera, look_x, look_y, dt)
+    _apply_look(camera, look_dx, look_dy)
 
     if GAME_MOVE_DEBUG:
         print(
