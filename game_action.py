@@ -451,7 +451,12 @@ def handle_message(message) -> None:
 
     camera.rotation_mode = 'QUATERNION'
 
-    # 地面标记命令 → 直接转交 car_action（与 car_mode 完全一致 ✓）
+    # ★ 参考无效（相机在 X-Y 平面之下且下方无物体）→ 移动/旋转全部禁用 ✗
+    #   统一在开头 return，避免后面任何计算 ✗
+    if not _reference_valid and camera.location.z < 0.0:
+        return
+
+    # 地面标记命令
     if data.get("command") in ("set_ground", "toggle_ground"):
         enabled = bool(data.get("enabled", False))
 
@@ -553,15 +558,6 @@ def handle_message(message) -> None:
         _apply_acceleration(wishdir, wishspeed, dt, accel)
 
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
-    # 参考无效（相机在 X-Y 平面之下且下方无物体）→ 移动/旋转全部禁用 ✗
-    if not _reference_valid and _game_ground_object is None:
-        try:
-            if bpy.context.scene.camera.location.z < 0.0:
-                _velocity = Vector((0.0, 0.0, 0.0))
-                return
-        except Exception:                          # noqa: BLE001
-            pass
-
     camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
 
     # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
@@ -578,9 +574,7 @@ def handle_message(message) -> None:
 
     look_mult = max(0.3, min(3.0, look_mult))
 
-    # 相机在 X-Y 平面之下且没有地面物体 → 旋转禁用 ✗
-    if not (not _reference_valid and camera.location.z < 0.0):
-        _apply_look(camera, look_dx, look_dy, look_mult)
+    _apply_look(camera, look_dx, look_dy, look_mult)
 
     if GAME_MOVE_DEBUG:
         print(
