@@ -557,6 +557,66 @@ def _apply_wall_collision(camera, wishdir: Vector, velocity: Vector) -> tuple:
     return result, vel
 
 
+def _sweep_camera_move(start: Vector, step: Vector) -> Vector:
+    """从【移动前】位置扫掠本帧位移，返回实际允许的位移 ✓
+
+    ⚠️ 只从移动后位置打 threshold 长的射线是不够的 ✗
+       推流 10fps 时单帧位移可达 0.4 单位，整面墙会被跨过去 ✗
+       这里扫掠 step + threshold，10/30/60fps 都不会穿 ✓
+
+    撞墙 → 停在墙前 threshold，并把 _velocity 投影到墙面（沿墙滑 ✓）
+    地面/缓坡 → 不挡水平移动（高度由 _follow_game_ground 负责 ✓）
+    """
+    global _velocity
+
+    if step.length_squared <= 1e-18:
+        return step
+
+    threshold = _wall_threshold_units()
+
+    if threshold <= 1e-6:
+        return step
+
+    direction = step.normalized()
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hit, loc, normal, idx, obj, matrix = bpy.context.scene.ray_cast(
+            depsgraph, start, direction, distance=step.length + threshold
+        )
+    except Exception:                              # noqa: BLE001
+        return step
+
+    if not hit or obj is None:
+        return step
+
+    n = Vector(normal).normalized()
+
+    # 地面 / 缓坡不挡水平移动 ✓
+    #   竖直面（墙）|n.z|≈0 → 挡；水平面（地面）|n.z|≈1 → 放行 ✓
+    if abs(n.z) > 0.7:
+        return step
+
+    # 撞墙：速度投影到墙面，下一帧沿墙滑 ✓
+    #   ⚠️ 只要扫掠命中就推出 ✗ 不能因为"墙在位移终点之外"就放行 ✗
+    #      否则终点已经进入阈值内时会一帧一帧蹭近，最后贴到墙面 ✗
+    _velocity = _velocity - n * _velocity.dot(n)
+
+    # 沿【墙面法线】退到 threshold 外 ✓
+    #   ⚠️ 只沿移动方向退 threshold 的话，斜撞时法线间距会被 cos 缩小 ✗
+    moved = Vector((
+        loc.x + n.x * threshold - start.x,
+        loc.y + n.y * threshold - start.y,
+        0.0,
+    ))
+
+    # 不允许倒退（起点已在阈值内时）✓
+    if moved.dot(direction) <= 0.0:
+        return Vector((0.0, 0.0, 0.0))
+
+    return moved
+
+
 def _apply_look(
     camera, look_dx: float, look_dy: float, multiplier: float = 1.0
 ) -> None:
@@ -746,25 +806,14 @@ def handle_message(message) -> None:
 
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
     prev_location = camera.location.copy()
+    step = Vector((_velocity.x, _velocity.y, 0.0)) * dt
 
-    camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
+    # ★ 防穿透：从【移动前】位置扫掠本帧位移（step + threshold）✓
+    #   ⚠️ 旧版从移动后位置只打 threshold → 10fps 单帧 0.4 会直接跨墙 ✗
+    if WALL_COLLISION_ENABLED and step.length_squared > 1e-18:
+        step = _sweep_camera_move(prev_location, step)
 
-    # ★ 保险：如果这一步把相机推进了阈值内 → 回退（防穿透 ✓）
-    if WALL_COLLISION_ENABLED:
-        try:
-            th = _wall_threshold_units()
-            dg = bpy.context.evaluated_depsgraph_get()
-            fwd = _velocity.copy()
-            if fwd.length > 1e-9 and th > 1e-6:
-                d = fwd.normalized()
-                hit2, loc2, n2, i2, o2, m2 = bpy.context.scene.ray_cast(
-                    dg, camera.location, d, distance=th
-                )
-                if hit2 and o2 is not None:
-                    camera.location = prev_location
-                    _velocity = Vector((0.0, 0.0, 0.0))
-        except Exception:                          # noqa: BLE001
-            pass
+    camera.location = prev_location + step
 
     # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
     _follow_game_ground(camera)
