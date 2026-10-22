@@ -27,9 +27,14 @@ import time
 import bpy
 from mathutils import Vector
 
-# 复用 car_action 的"贴地"机制（is_ground 标记 / PCA 拟合 / 姿态对齐）
-#   ⚠️ 两个模式不会同时激活 ✓ 共用一份状态是安全的 ✓
-from . import car_action
+# ── game mode 的"贴地"标记（与 car_mode 的 is_ground 分开 ✗）──
+GAME_GROUND_TAG: str = "is_game_ground"
+
+# 被标记为游戏地面的物体
+_game_ground_object = None
+
+# 实测的"相机到地面"的 Z 方向距离（= 用户摆的高度 ✓）
+_game_ground_height: float = 0.0
 
 
 # ── 手感参数（参考 CS:GO / Apex）───────────────────────────
@@ -131,6 +136,124 @@ def _stick_to_depth(magnitude: float) -> float:
     return depth**GAME_CURVE_POWER
 
 
+def _find_tagged_game_ground():
+    """找带 is_game_ground 属性的 MESH 物体。"""
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if obj.get(GAME_GROUND_TAG, False):
+            return obj
+    return None
+
+
+def _clear_game_ground() -> None:
+    """删掉所有 is_game_ground 属性。"""
+    global _game_ground_object, _game_ground_height
+
+    count = 0
+    for obj in bpy.data.objects:
+        if obj.get(GAME_GROUND_TAG, False):
+            try:
+                del obj[GAME_GROUND_TAG]
+                count += 1
+            except Exception:                      # noqa: BLE001
+                pass
+
+    _game_ground_object = None
+    _game_ground_height = 0.0
+
+    print(f"[Blecaco][Game] 已清除游戏地面标记（{count} 个物体）")
+
+
+def _set_game_ground() -> bool:
+    """沿相机局部 -Y 打射线，把第一个命中的物体标记为游戏地面。
+
+    同时记录相机到命中点的【Z 方向距离】→ 之后一直保持这个高度 ✓
+    """
+    global _game_ground_object, _game_ground_height
+
+    _clear_game_ground()
+
+    scene = bpy.context.scene
+    camera = scene.camera
+
+    if camera is None:
+        print("[Blecaco][Game] 没有活动相机")
+        return False
+
+    direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+
+        hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+            depsgraph, camera.location, direction, distance=1000.0
+        )
+
+        # 打空 → 退回世界 -Z
+        if not hit or obj is None:
+            hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+                depsgraph, camera.location, Vector((0.0, 0.0, -1.0)),
+                distance=2000.0,
+            )
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[Blecaco][Game] 地面射线异常：{exc}")
+        return False
+
+    if not hit or obj is None:
+        print("[Blecaco][Game] 相机下方没有物体，标记失败")
+        return False
+
+    obj[GAME_GROUND_TAG] = True
+    _game_ground_object = obj
+
+    # 记录 Z 方向的距离（正是用户摆的离地高度 ✓）
+    _game_ground_height = camera.location.z - loc.z
+
+    print(
+        f"[Blecaco][Game] 游戏地面已标记：{obj.name} "
+        f"离地高度 = {_game_ground_height:.3f}"
+    )
+    return True
+
+
+def _follow_game_ground(camera) -> None:
+    """把相机 Z 保持在"地面高度 + 实测距离"上。
+
+    不改变旋转 ✓（相机 X 轴始终平行于世界 X-Y 平面 ✓）
+    """
+    if _game_ground_object is None:
+        return
+
+    try:
+        obj = _game_ground_object
+        obj_name = obj.name
+    except ReferenceError:
+        _clear_game_ground()
+        return
+
+    # 用世界 -Z 在这个物体上打射线，取它当前正下方的高度
+    try:
+        inv = obj.matrix_world.inverted()
+        local_origin = inv @ camera.location
+        local_dir = (inv.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+
+        hit, loc, normal, idx = obj.ray_cast(local_origin, local_dir, distance=1000.0)
+    except Exception:                              # noqa: BLE001
+        return
+
+    if not hit:
+        return
+
+    world_loc = obj.matrix_world @ loc
+
+    camera.location = Vector((
+        camera.location.x,
+        camera.location.y,
+        world_loc.z + _game_ground_height,
+    ))
+
+
 def handle_message(message) -> None:
     global _last_message_time
 
@@ -150,7 +273,13 @@ def handle_message(message) -> None:
 
     # 地面标记命令 → 直接转交 car_action（与 car_mode 完全一致 ✓）
     if data.get("command") in ("set_ground", "toggle_ground"):
-        car_action.handle_message(message)
+        enabled = bool(data.get("enabled", False))
+
+        if enabled:
+            _set_game_ground()
+        else:
+            _clear_game_ground()
+
         return
 
     # 初始化：清零速度 + 记录时间基准
@@ -243,20 +372,8 @@ def handle_message(message) -> None:
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
     camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
 
-    # ── 贴地（与 car_mode 完全一致 ✓）──────────────────
-    if car_action._ground_object is not None:
-        camera.location = car_action._apply_ground_height(
-            camera, camera.location, dt
-        )
-
-        # 相机 Y 轴 ⟂ 拟合平面法线（car_action 里算好的 ✓）
-        if car_action._ground_normal is not None:
-            camera.rotation_quaternion = car_action._align_quaternion_to_normal(
-                camera.rotation_quaternion, car_action._ground_normal
-            )
-
-    # 实时检测脚下物体是否带 is_ground（100ms 节流 ✓）
-    car_action._check_under_camera()
+    # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
+    _follow_game_ground(camera)
 
     if GAME_MOVE_DEBUG:
         print(
