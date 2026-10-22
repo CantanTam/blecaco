@@ -27,6 +27,10 @@ import time
 import bpy
 from mathutils import Vector
 
+# 复用 car_action 的"贴地"机制（is_ground 标记 / PCA 拟合 / 姿态对齐）
+#   ⚠️ 两个模式不会同时激活 ✓ 共用一份状态是安全的 ✓
+from . import car_action
+
 
 # ── 手感参数（参考 CS:GO / Apex）───────────────────────────
 # 最大移动速度（单位/秒）
@@ -144,6 +148,11 @@ def handle_message(message) -> None:
 
     camera.rotation_mode = 'QUATERNION'
 
+    # 地面标记命令 → 直接转交 car_action（与 car_mode 完全一致 ✓）
+    if data.get("command") in ("set_ground", "toggle_ground"):
+        car_action.handle_message(message)
+        return
+
     # 初始化：清零速度 + 记录时间基准
     if data.get("command") == "initialize":
         _reset_state()
@@ -233,6 +242,21 @@ def handle_message(message) -> None:
 
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
     camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
+
+    # ── 贴地（与 car_mode 完全一致 ✓）──────────────────
+    if car_action._ground_object is not None:
+        camera.location = car_action._apply_ground_height(
+            camera, camera.location, dt
+        )
+
+        # 相机 Y 轴 ⟂ 拟合平面法线（car_action 里算好的 ✓）
+        if car_action._ground_normal is not None:
+            camera.rotation_quaternion = car_action._align_quaternion_to_normal(
+                camera.rotation_quaternion, car_action._ground_normal
+            )
+
+    # 实时检测脚下物体是否带 is_ground（100ms 节流 ✓）
+    car_action._check_under_camera()
 
     if GAME_MOVE_DEBUG:
         print(
