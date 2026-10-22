@@ -156,7 +156,8 @@ CAR_FLAT_PLANE_Z: float = 0.0
 _mesh_cell_cache: "dict[str, float]" = {}
 
 # 移动中实时检测：相机下方第一个物体是否带 is_ground
-_under_is_ground: "bool | None" = None     # None = 还没检测过
+_under_is_ground: "bool | None" = None
+_under_has_surface: bool = False     # None = 还没检测过
 _under_check_time: float = 0.0
 UNDER_CHECK_INTERVAL: float = 0.1          # 每 100ms 检测一次（够实时，也不费）
 
@@ -207,6 +208,7 @@ def _notify_ground_indicator(has_ground: bool) -> None:
         server.send_text(json.dumps({
             "type": "ground_indicator",
             "has_ground": bool(has_ground),
+            "has_surface": bool(_under_has_surface),
         }))
     except Exception as exc:                       # noqa: BLE001
         print(f"[Blecaco][Car] ground_indicator 发送失败：{exc}")
@@ -243,14 +245,23 @@ def _check_under_camera() -> None:
         return
 
     has_ground = False
+    has_surface = bool(hit and obj is not None)
 
-    if hit and obj is not None:
+    global _under_has_surface
+    surface_changed = has_surface != _under_has_surface
+    _under_has_surface = has_surface
+
+    if has_surface:
         try:
             has_ground = bool(obj.get("is_ground", False))
         except ReferenceError:
             has_ground = False
 
-    if _under_is_ground is None or has_ground != _under_is_ground:
+    if (
+        _under_is_ground is None
+        or has_ground != _under_is_ground
+        or surface_changed
+    ):
         _under_is_ground = has_ground
         _notify_ground_indicator(has_ground)
 
@@ -907,8 +918,9 @@ def handle_message(message):
     if forward != 0.0:
         _move_forward(forward)
 
-        # 移动中：实时检测脚下物体是否带 is_ground → 状态变化时推送手机 ✓
-        _check_under_camera()
+    # 无论是否移动都检测（100ms 节流 ✓）
+    #   → 手机据此判断"能不能长按拖动 SetGround"✓
+    _check_under_camera()
 
 # ============================================================
 # 局部平面拟合（把"单个三角面法线"换成"邻域拟合平面" ✓）
