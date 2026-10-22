@@ -34,12 +34,22 @@ GAME_GROUND_TAG: str = "is_game_ground"
 # 被标记为游戏地面的物体
 _game_ground_object = None
 
-# 实测的"相机到地面"的 Z 方向距离（= 用户摆的高度 ✓）
-_game_ground_height: float = 0.0
+# 参考距离：相机到命中点的 Z 方向距离，代表 GAME_BODY_HEIGHT_M（1.8 米）✓
+_ground_reference_distance: float = 0.0
+
+# 是否已确定有效参考（False = 用兜底 GAME_MAX_SPEED）
+_reference_valid: bool = False
 
 
 # ── 手感参数（参考 CS:GO / Apex）───────────────────────────
 # 最大移动速度（单位/秒）
+# 1.8 米身高对应的【米/秒】（主流 FPS：CS:GO 250ups≈4.76m/s，COD≈4.2m/s）
+GAME_WALK_MPS: float = 4.5
+
+# 参考身高（米）—— 用来把"实测相机高度"换算成米
+GAME_BODY_HEIGHT_M: float = 1.8
+
+# 兜底：没有有效参考距离时用的绝对速度（单位/秒）
 GAME_MAX_SPEED: float = 6.0
 
 # 加速度系数（越大起步越快；10 ≈ 0.1 秒到满速）
@@ -233,7 +243,7 @@ def _find_tagged_game_ground():
 
 def _clear_game_ground() -> None:
     """删掉所有 is_game_ground 属性。"""
-    global _game_ground_object, _game_ground_height
+    global _game_ground_object, _ground_reference_distance
 
     count = 0
     for obj in bpy.data.objects:
@@ -245,19 +255,19 @@ def _clear_game_ground() -> None:
                 pass
 
     _game_ground_object = None
-    _game_ground_height = 0.0
+    _ground_reference_distance = 0.0
 
     print(f"[Blecaco][Game] 已清除游戏地面标记（{count} 个物体）")
 
 
 def _set_game_ground() -> bool:
-    """沿相机局部 -Y 打射线，把第一个命中的物体标记为游戏地面。
+    """确定追踪地面 + 记录参考距离。
 
-    同时记录相机到命中点的【Z 方向距离】→ 之后一直保持这个高度 ✓
+    命中 → 旧物体取消标记，新物体打标，D = camera.z - hit.z
+    未命中 + camera.z >= 0 → D = camera.z（用世界 X-Y 平面当"地面"）
+    未命中 + camera.z <  0 → 标记无效（移动/旋转禁用）
     """
-    global _game_ground_object, _game_ground_height
-
-    _clear_game_ground()
+    global _game_ground_object, _ground_reference_distance, _reference_valid
 
     scene = bpy.context.scene
     camera = scene.camera
@@ -267,6 +277,10 @@ def _set_game_ground() -> bool:
         return False
 
     direction = camera.rotation_quaternion @ Vector((0.0, -1.0, 0.0))
+
+    hit = False
+    loc = None
+    obj = None
 
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -281,25 +295,70 @@ def _set_game_ground() -> bool:
                 depsgraph, camera.location, Vector((0.0, 0.0, -1.0)),
                 distance=2000.0,
             )
+            if hit and obj is not None:
+                print("[Blecaco][Game] 相机 -Y 未命中，改用竖直向下命中 ✓")
     except Exception as exc:                       # noqa: BLE001
         print(f"[Blecaco][Game] 地面射线异常：{exc}")
+        hit = False
+
+    # ── 未命中 ─────────────────────────────────────
+    if not hit or obj is None:
+        if camera.location.z >= 0.0:
+            # 用世界 X-Y 平面当"地面" ✓
+            _clear_game_ground()
+
+            _ground_reference_distance = camera.location.z
+            _reference_valid = _ground_reference_distance > 1e-4
+
+            print(
+                f"[Blecaco][Game] 相机下方无物体 → 用 X-Y 平面，"
+                f"参考距离 = {_ground_reference_distance:.3f}"
+            )
+            return _reference_valid
+
+        # 相机在 X-Y 平面之下 → 无效 ✗
+        _clear_game_ground()
+        _reference_valid = False
+        print("[Blecaco][Game] 相机在 X-Y 平面之下 → 移动/旋转禁用 ✗")
         return False
 
-    if not hit or obj is None:
-        print("[Blecaco][Game] 相机下方没有物体，标记失败")
-        return False
+    # ── 命中 ───────────────────────────────────────
+    # 只清除旧标记（其他物体的 is_game_ground）
+    for o in bpy.data.objects:
+        if o.get(GAME_GROUND_TAG, False) and o != obj:
+            try:
+                del o[GAME_GROUND_TAG]
+            except Exception:                      # noqa: BLE001
+                pass
 
     obj[GAME_GROUND_TAG] = True
     _game_ground_object = obj
 
-    # 记录 Z 方向的距离（正是用户摆的离地高度 ✓）
-    _game_ground_height = camera.location.z - loc.z
+    # D = Z 方向距离 ✓
+    _ground_reference_distance = camera.location.z - loc.z
+    if _ground_reference_distance < 0.0:
+        _ground_reference_distance = abs(_ground_reference_distance)
+
+    _reference_valid = _ground_reference_distance > 1e-4
 
     print(
         f"[Blecaco][Game] 游戏地面已标记：{obj.name} "
-        f"离地高度 = {_game_ground_height:.3f}"
+        f"参考距离 = {_ground_reference_distance:.3f}"
+        f"（代表 {GAME_BODY_HEIGHT_M} 米）"
     )
-    return True
+    return _reference_valid
+
+
+## 当前有效的基础速度（单位/秒）
+def _walk_speed_units() -> float:
+    """把 GAME_WALK_MPS（米/秒）换算成当前场景的单位/秒。
+
+    1 单位 = GAME_BODY_HEIGHT_M / D 米  →  速度(单位) = 速度(米) × D / 1.8
+    """
+    if not _reference_valid or _ground_reference_distance <= 1e-6:
+        return GAME_MAX_SPEED
+
+    return GAME_WALK_MPS * _ground_reference_distance / GAME_BODY_HEIGHT_M
 
 
 def _follow_game_ground(camera) -> None:
@@ -335,7 +394,7 @@ def _follow_game_ground(camera) -> None:
     camera.location = Vector((
         camera.location.x,
         camera.location.y,
-        world_loc.z + _game_ground_height,
+        world_loc.z + _ground_reference_distance,
     ))
 
 
@@ -475,7 +534,7 @@ def handle_message(message) -> None:
 
         # 行走速度对所有档位一致 ✓
         # 冲刺速度 = 行走速度 × 档位倍率 ✓
-        base_speed = GAME_MAX_SPEED * depth
+        base_speed = _walk_speed_units() * depth
 
         if sprinting:
             wishspeed = base_speed * run_multiplier
@@ -494,6 +553,15 @@ def handle_message(message) -> None:
         _apply_acceleration(wishdir, wishspeed, dt, accel)
 
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
+    # 参考无效（相机在 X-Y 平面之下且下方无物体）→ 移动/旋转全部禁用 ✗
+    if not _reference_valid and _game_ground_object is None:
+        try:
+            if bpy.context.scene.camera.location.z < 0.0:
+                _velocity = Vector((0.0, 0.0, 0.0))
+                return
+        except Exception:                          # noqa: BLE001
+            pass
+
     camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
 
     # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
@@ -509,7 +577,10 @@ def handle_message(message) -> None:
         look_mult = 1.0
 
     look_mult = max(0.3, min(3.0, look_mult))
-    _apply_look(camera, look_dx, look_dy, look_mult)
+
+    # 相机在 X-Y 平面之下且没有地面物体 → 旋转禁用 ✗
+    if not (not _reference_valid and camera.location.z < 0.0):
+        _apply_look(camera, look_dx, look_dy, look_mult)
 
     if GAME_MOVE_DEBUG:
         print(
