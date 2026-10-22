@@ -475,18 +475,18 @@ def _wall_threshold_units() -> float:
     return (WALL_COLLISION_CM / 100.0) / meters_per_unit
 
 
-def _apply_wall_collision(camera, wishdir: Vector) -> Vector:
+def _apply_wall_collision(camera, wishdir: Vector, velocity: Vector) -> tuple:
     """6 方向短射线 + 把 wishdir 投影到表面（沿墙滑动 ✓）。
 
     只检查【朝向墙面】的方向，跳过地面物体本身 ✗
     """
     if not WALL_COLLISION_ENABLED:
-        return wishdir
+        return wishdir, velocity
 
     threshold = _wall_threshold_units()
 
     if threshold <= 1e-6 or wishdir.length_squared < 1e-12:
-        return wishdir
+        return wishdir, velocity
 
     scene = bpy.context.scene
     quat = camera.rotation_quaternion
@@ -504,9 +504,10 @@ def _apply_wall_collision(camera, wishdir: Vector) -> Vector:
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
     except Exception:                              # noqa: BLE001
-        return wishdir
+        return wishdir, velocity
 
     result = wishdir.copy()
+    vel = velocity.copy()
 
     for d in axes:
         d = d.normalized()
@@ -532,11 +533,15 @@ def _apply_wall_collision(camera, wishdir: Vector) -> Vector:
         except ReferenceError:
             continue
 
-        # 把速度投影到表面（滑过去 ✓）
+        # 把【输入方向】投影到表面（滑过去 ✓）
         n = Vector(normal).normalized()
         result = result - n * result.dot(n)
 
-    return result
+        # ★ 把【当前速度】也投影掉 ✓
+        #   否则 snappy 的惯性会继续把相机推进墙里 ✗
+        vel = vel - n * vel.dot(n)
+
+    return result, vel
 
 
 def _apply_look(
@@ -690,7 +695,11 @@ def handle_message(message) -> None:
             wishdir = direction.normalized()
 
         # ── 相机防撞（6 方向射线 + 滑动 ✓）────────────────
-        wishdir = _apply_wall_collision(camera, wishdir)
+        #   ⚠️ 必须同时挡 _velocity ✗ 否则 snappy 惯性会继续推进 ✗
+        blocked_dir, blocked_vel = _apply_wall_collision(camera, wishdir, _velocity)
+
+        wishdir = blocked_dir
+        _velocity = blocked_vel
 
         if wishdir.length > 1e-6:
             wishdir = wishdir.normalized()
@@ -723,7 +732,26 @@ def handle_message(message) -> None:
         _apply_acceleration(wishdir, wishspeed, dt, accel)
 
     # ── 速度积分位置（保持 z 不变，纯水平移动 ✓）────────
+    prev_location = camera.location.copy()
+
     camera.location = camera.location + Vector((_velocity.x, _velocity.y, 0.0)) * dt
+
+    # ★ 保险：如果这一步把相机推进了阈值内 → 回退（防穿透 ✓）
+    if WALL_COLLISION_ENABLED:
+        try:
+            th = _wall_threshold_units()
+            dg = bpy.context.evaluated_depsgraph_get()
+            fwd = _velocity.copy()
+            if fwd.length > 1e-9 and th > 1e-6:
+                d = fwd.normalized()
+                hit2, loc2, n2, i2, o2, m2 = bpy.context.scene.ray_cast(
+                    dg, camera.location, d, distance=th
+                )
+                if hit2 and o2 is not None and not o2.get(GAME_GROUND_TAG, False):
+                    camera.location = prev_location
+                    _velocity = Vector((0.0, 0.0, 0.0))
+        except Exception:                          # noqa: BLE001
+            pass
 
     # ── 贴地（简化版：只保持 Z 高度，不改旋转 ✓）────────
     _follow_game_ground(camera)
