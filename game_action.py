@@ -348,13 +348,15 @@ def _apply_look(camera, look_x: float, look_y: float, dt: float) -> None:
     quat = camera.rotation_quaternion
 
     # ① 左右：绕世界 Z 轴（前乘 ✓）
+    #   手指右（look_x > 0）→ 相机右转 → 绕 +Z 顺时针 = 负角 ✓
     if abs(look_x) > 1e-4:
-        yaw = math.radians(GAME_LOOK_YAW_SPEED * dt * look_x)
+        yaw = math.radians(-GAME_LOOK_YAW_SPEED * dt * look_x)
         quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
 
     # ② 上下：绕相机局部 X 轴（后乘 ✓）
     if abs(look_y) > 1e-4:
-        pitch = math.radians(GAME_LOOK_PITCH_SPEED * dt * look_y)
+        # 手指上（look_y < 0）→ 抬头 → 绕局部 X 正角 ✓
+        pitch = math.radians(-GAME_LOOK_PITCH_SPEED * dt * look_y)
         quat = quat @ Quaternion((1.0, 0.0, 0.0), pitch)
 
         # 俯仰限位：看前方向量的 Z 分量不能超过 sin(limit) ✓
@@ -366,7 +368,7 @@ def _apply_look(camera, look_x: float, look_y: float, dt: float) -> None:
             quat = camera.rotation_quaternion
 
             if abs(look_x) > 1e-4:
-                yaw = math.radians(GAME_LOOK_YAW_SPEED * dt * look_x)
+                yaw = math.radians(-GAME_LOOK_YAW_SPEED * dt * look_x)
                 quat = Quaternion((0.0, 0.0, 1.0), yaw) @ quat
 
     camera.rotation_quaternion = quat
