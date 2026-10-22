@@ -1505,6 +1505,7 @@ def handle_message(data):
     # 地面标记命令（car_mode 长按 SetGround）
     #   走 setting 通道是因为 SetGround 只在 unlink 显示，
     #   而 unlink 会禁用 action 发送 ✗ setting 通道不受门控 ✓
+    # car_mode 的地面标记
     if name == "ground":
         try:
             from . import car_action
@@ -1516,6 +1517,20 @@ def handle_message(data):
             })
         except Exception as exc:                   # noqa: BLE001
             print(f"[blecaco] 地面命令处理失败：{exc}")
+        return
+
+    # game_mode 的地面标记（is_game_ground ✓ 与 car_mode 的 is_ground 分开）
+    if name == "game_ground":
+        try:
+            from . import game_action
+            game_action.handle_message({
+                "data": {
+                    "command": "set_ground",
+                    "enabled": bool(data.get("value", False)),
+                },
+            })
+        except Exception as exc:                   # noqa: BLE001
+            print(f"[blecaco] 游戏地面命令处理失败：{exc}")
         return
 
     # 手机打开摄像机页时会来要一份列表（value 是 null）→ 立刻回推，
