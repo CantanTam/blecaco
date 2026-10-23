@@ -196,7 +196,7 @@ bl_info = {
     "name": "Blecaco",
     "author": "Canta Tam",
     "version": (0, 1, 0),
-    "blender": (4, 5, 0),
+    "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Blecaco",
     "description": "把 Blender 视口通过 WebSocket + JPEG 推到浏览器/Godot",
     "category": "3D View",
