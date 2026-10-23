@@ -43,6 +43,14 @@ RIG_LONG_SPEED: float = 2.0
 # 右杆"上推"是否走 +Y（False 则上推走 -Y）
 RIGHT_STICK_UP_POSITIVE_Y: bool = True
 
+# ── 相机防撞（DroneCollision）────────────────────────────
+# 方案 C：drone 场景假设 1 单位 = 1 米 → 30cm = 0.3 单位
+#   当前相机 clip_start=0.1，2×=0.2 < 0.3，所以 0.3 也覆盖近裁剪面
+#   ⚠️ 与 game_action 的 WALL_COLLISION_* 完全分开命名，避免数据串台
+DRONE_COLLISION_ENABLED: bool = True
+DRONE_COLLISION_DISTANCE: float = 0.3
+DRONE_COLLISION_DEBUG: bool = True
+
 # ── 速度档位（由手机端按摇杆距离分档，随颜色变化）──
 # 档位切换时的加速度 / 减速度（倍率/秒）：避免速度突变
 SPEED_TIER_ACCEL: float = 3.0
@@ -113,8 +121,112 @@ def _get_camera():
     return camera
 
 
+def _apply_drone_collision(camera, step: Vector) -> Vector:
+    """DroneCollision：6 方向近距射线 + 3D 位移扫掠，沿表面滑动 ✓
+
+    方案 C：1 单位 = 1 米，30cm = 0.3 单位。
+    与 game_action 的 _apply_wall_collision/_sweep_camera_move 完全分开，
+    变量名、阈值、日志都不共用。
+    """
+    if not DRONE_COLLISION_ENABLED or step.length_squared < 1e-12:
+        return step
+
+    distance = DRONE_COLLISION_DISTANCE
+    scene = bpy.context.scene
+    quat = camera.rotation_quaternion
+
+    axes = [
+        quat @ Vector((1.0, 0.0, 0.0)),
+        quat @ Vector((-1.0, 0.0, 0.0)),
+        quat @ Vector((0.0, 0.0, -1.0)),
+        quat @ Vector((0.0, 0.0, 1.0)),
+        quat @ Vector((0.0, 1.0, 0.0)),
+        quat @ Vector((0.0, -1.0, 0.0)),
+    ]
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception:                              # noqa: BLE001
+        return step
+
+    result = step.copy()
+
+    for d in axes:
+        d = d.normalized()
+
+        # 只在"朝着这个方向移动"时才检测 ✓
+        if result.dot(d) <= 1e-4:
+            continue
+
+        try:
+            hit, loc, normal, idx, obj, matrix = scene.ray_cast(
+                depsgraph, camera.location, d, distance=distance
+            )
+        except Exception:                          # noqa: BLE001
+            continue
+
+        if not hit or obj is None:
+            continue
+
+        if DRONE_COLLISION_DEBUG:
+            print(
+                f"[Blecaco][Drone] 防撞命中 {obj.name} "
+                f"阈值={distance:.2f} 法线=({normal.x:.2f},{normal.y:.2f},{normal.z:.2f})"
+            )
+
+        n = Vector(normal).normalized()
+        result = result - n * result.dot(n)
+
+    return _sweep_drone_move(camera.location, result, distance)
+
+
+def _sweep_drone_move(start: Vector, step: Vector, distance: float) -> Vector:
+    """从移动前位置扫掠 step + distance；命中后沿法线退到 distance 外 ✓
+
+    drone 是 3D 移动（含升降），所以地面/天花板/墙都挡，不按 n.z 过滤。
+    """
+    if step.length_squared <= 1e-18:
+        return step
+
+    direction = step.normalized()
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hit, loc, normal, idx, obj, matrix = bpy.context.scene.ray_cast(
+            depsgraph, start, direction, distance=step.length + distance
+        )
+    except Exception:                              # noqa: BLE001
+        return step
+
+    if not hit or obj is None:
+        return step
+
+    n = Vector(normal).normalized()
+
+    if DRONE_COLLISION_DEBUG:
+        print(
+            f"[Blecaco][Drone] 防撞扫掠 {obj.name} "
+            f"距离={distance:.2f} 法线=({n.x:.2f},{n.y:.2f},{n.z:.2f})"
+        )
+
+    # 沿法线退到 distance 外；moved 可能带一点横向分量（斜撞时更安全）
+    moved = Vector((
+        loc.x + n.x * distance - start.x,
+        loc.y + n.y * distance - start.y,
+        loc.z + n.z * distance - start.z,
+    ))
+
+    # 不允许倒退（起点已经在阈值内时）✓
+    if moved.dot(direction) <= 0.0:
+        return Vector((0.0, 0.0, 0.0))
+
+    return moved
+
+
 def handle_message(message):
     """handler.py 传进来的是**整条消息** {type, mode, data}，这里取出内层 data。"""
+    global DRONE_COLLISION_ENABLED
+
     if not isinstance(message, dict):
         print("[Blecaco][Drone] 消息不是字典，已忽略")
         return
@@ -124,6 +236,9 @@ def handle_message(message):
     if not isinstance(data, dict):
         print("[Blecaco][Drone] data 不是字典，已忽略")
         return
+
+    if "drone_collision" in data:
+        DRONE_COLLISION_ENABLED = bool(data["drone_collision"])
 
     command = data.get("command")
 
@@ -269,6 +384,9 @@ def handle_message(message):
         + y_axis_flat * longitudinal
         + Vector((0.0, 0.0, lift))
     )
+
+    if DRONE_COLLISION_ENABLED and step_world.length_squared > 1e-18:
+        step_world = _apply_drone_collision(camera, step_world)
 
     if step_world.length > 0.0:
         camera.location = camera.location + step_world
