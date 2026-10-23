@@ -77,6 +77,16 @@ print(
 # Car Mode 摄像机移动速度倍数
 CAR_MOVE_SPEED_MULTIPLIER: float = 5.0
 
+# ── CarCollision：车辆防撞 ──────────────────────────────
+# 与游戏 WallCollision / 无人机 DroneCollision 完全独立。
+# 标定：相机到“追踪地面或水平面”的距离 = 1 米；
+#       防撞距离 = 2 米 → 阈值 = 2 × 该距离（Blender 单位）。
+CAR_COLLISION_ENABLED: bool = True
+CAR_COLLISION_REFERENCE_M: float = 1.0
+CAR_COLLISION_DISTANCE_M: float = 2.0
+CAR_COLLISION_FALLBACK_UNITS: float = 2.0
+CAR_COLLISION_DEBUG: bool = True
+
 # ── 地面追踪（Level 2：跟随地形起伏）─────────────────────
 # 开启后：
 #   1) 前进方向压平到水平面（低头不会钻地、抬头不会飞天）
@@ -621,6 +631,127 @@ def _apply_ground_height(camera, new_location: Vector, delta: float) -> Vector:
     return new_location
 
 
+def _car_collision_units() -> float:
+    """2 米对应的 Blender 单位数：相机到地面/水平面的距离 × 2。"""
+    camera = bpy.context.scene.camera
+    distance = None
+
+    if _measured_eye_height is not None and _measured_eye_height > 1e-6:
+        distance = _measured_eye_height
+    elif camera is not None and camera.location.z > 1e-6:
+        distance = camera.location.z
+
+    if distance is None or distance <= 1e-6:
+        return CAR_COLLISION_FALLBACK_UNITS
+
+    return (
+        CAR_COLLISION_DISTANCE_M
+        / CAR_COLLISION_REFERENCE_M
+    ) * distance
+
+
+def _sweep_car_move(start: Vector, step: Vector, distance: float) -> Vector:
+    """沿车辆本帧位移扫掠；命中墙后，把目标推到离墙 distance 的位置。"""
+    if step.length_squared < 1e-12:
+        return step
+
+    direction = step.normalized()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    hit, loc, normal, index, obj, matrix = bpy.context.scene.ray_cast(
+        depsgraph,
+        start,
+        direction,
+        distance=step.length + distance,
+    )
+
+    if not hit:
+        return step
+
+    normal = Vector(normal)
+
+    # 地面/天花板不参与车辆水平防撞（车辆本来就在地面上）
+    if abs(normal.z) > 0.7:
+        return step
+
+    moved = loc + normal * distance - start
+
+    if moved.dot(direction) <= 0.0:
+        return Vector((0.0, 0.0, 0.0))
+
+    if CAR_COLLISION_DEBUG:
+        name = obj.name if obj is not None else "?"
+        print(
+            f"[Blecaco][Car] 防撞扫掠：{name} "
+            f"法线={tuple(round(v, 2) for v in normal)}"
+        )
+
+    return moved
+
+
+def _apply_car_collision(camera, new_location: Vector) -> Vector:
+    """6 向近距射线 + 前向扫掠，返回裁剪后的目标位置。"""
+    step = Vector((
+        new_location.x - camera.location.x,
+        new_location.y - camera.location.y,
+        0.0,
+    ))
+
+    if step.length_squared < 1e-12:
+        return new_location
+
+    distance = _car_collision_units()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    result = step.copy()
+    quat = camera.rotation_quaternion
+    axes = (
+        Vector((1.0, 0.0, 0.0)),
+        Vector((-1.0, 0.0, 0.0)),
+        Vector((0.0, 1.0, 0.0)),
+        Vector((0.0, -1.0, 0.0)),
+        Vector((0.0, 0.0, 1.0)),
+        Vector((0.0, 0.0, -1.0)),
+    )
+
+    for axis in axes:
+        direction = (quat @ axis).normalized()
+
+        if result.dot(direction) <= 1e-4:
+            continue
+
+        hit, loc, normal, index, obj, matrix = bpy.context.scene.ray_cast(
+            depsgraph,
+            camera.location,
+            direction,
+            distance=distance,
+        )
+
+        if not hit:
+            continue
+
+        normal = Vector(normal)
+
+        if abs(normal.z) > 0.7:
+            continue
+
+        result -= normal * result.dot(normal)
+
+        if CAR_COLLISION_DEBUG:
+            name = obj.name if obj is not None else "?"
+            print(
+                f"[Blecaco][Car] 防撞命中：{name} "
+                f"法线={tuple(round(v, 2) for v in normal)}"
+            )
+
+    moved = _sweep_car_move(camera.location, result, distance)
+
+    out = new_location.copy()
+    out.x = camera.location.x + moved.x
+    out.y = camera.location.y + moved.y
+    return out
+
+
 def _move_forward(raw_distance: float) -> None:
     """前进。
 
@@ -661,6 +792,10 @@ def _move_forward(raw_distance: float) -> None:
 
     new_location = _target_location + forward * distance
 
+    # CarCollision：先裁剪水平位移，再做地面高度贴合
+    if CAR_COLLISION_ENABLED:
+        new_location = _apply_car_collision(camera, new_location)
+
     if CAR_GROUND_FOLLOW:
         speed = max(abs(CAR_MOVE_SPEED_MULTIPLIER), 1e-3)
         delta = abs(distance) / speed
@@ -683,6 +818,7 @@ def handle_message(message):
     global _car_yaw, _last_message_time, _steer_lock
     global _steer_in_deadzone
     global _last_heading, _ground_normal, _ground_z
+    global CAR_COLLISION_ENABLED
 
     data = message.get("data", {})
 
@@ -693,6 +829,10 @@ def handle_message(message):
     if not isinstance(data, dict):
         print("[Blecaco][Car] Invalid data")
         return
+
+    # 手机端的 CarCollision 开关（每条姿态消息都会带；旧版没有则保持 True）
+    if "car_collision" in data:
+        CAR_COLLISION_ENABLED = bool(data["car_collision"])
 
     # 兼容单独发送的 forward 消息
     if data.get("command") == "forward":
