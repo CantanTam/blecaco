@@ -1,5 +1,8 @@
 # Blecaco 外部依赖与 git clone 恢复指南
 
+> **如果你安装的是发布 zip（`blecaco-0.1.0.zip`）**：包内已经包含 `wheels/`、`websockets/`、`qrcode/`，首次启用会自动从 `wheels/` 解压 Pillow，直接安装即可。  
+> 下面的恢复步骤只用于 git clone、换平台或换 Blender 版本。
+
 Blecaco 是一个 Blender 插件（`bl_info` 最低 Blender 4.5，实测 5.2.1）。  
 它**不依赖 Blender 自带的 site-packages**，而是把需要的 Python 库放在插件目录里：
 
